@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: custom-call-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        value: "7034779471"
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: CALL_API_TOKEN
+        sync: false
+      - key: CALL_API_BASE
+        value: https://sms.bd1b.com/api/v1
+      - key: CALL_WEBHOOK_SECRET
+        sync: false
+      - key: PAYMENT_REVIEW_CHAT_ID
+        value: "@ffxemon"
+      - key: FIREBASE_DATABASE_URL
+        value: https://all-14992-default-rtdb.firebaseio.com
+      - key: FIREBASE_STORAGE_BUCKET
+        value: all-14992.firebasestorage.app
+      - key: FIREBASE_CREDENTIALS_JSON
+        sync: false
