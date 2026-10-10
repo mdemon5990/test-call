@@ -23,7 +23,7 @@ from firebase_admin import credentials, db as firebase_db, storage
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
@@ -44,6 +44,7 @@ CALL_API_TOKEN = os.getenv("CALL_API_TOKEN", "").strip()
 CALL_API_BASE = os.getenv("CALL_API_BASE", "https://sms.bd1b.com/api/v1").rstrip("/")
 CALL_WEBHOOK_SECRET = os.getenv("CALL_WEBHOOK_SECRET", "").strip()
 PAYMENT_REVIEW_CHAT_ID = os.getenv("PAYMENT_REVIEW_CHAT_ID", "@ffxemon").strip()
+SUPPORT_CONTACT_URL = os.getenv("SUPPORT_CONTACT_URL", f"tg://user?id={os.getenv('ADMIN_ID', '7034779471').strip()}").strip()
 REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "@CyberShunya_x").strip() or "@CyberShunya_x"
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").strip()
 FIREBASE_CREDENTIALS_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON", "").strip()
@@ -263,7 +264,7 @@ db = _DatabaseCompat()
 bucket = None
 if FIREBASE_STORAGE_BUCKET:
     try:
-        bucket = storage.bucket()
+        bucket = storage.bucket(FIREBASE_STORAGE_BUCKET)
     except Exception:
         bucket = None
 
@@ -300,7 +301,8 @@ DEFAULT_SETTINGS = {
     "purchase_limit_minutes": 10,
     "required_channel": REQUIRED_CHANNEL_USERNAME,
     "min_redeem_credits": 1.0,
-    "support_text": "Support er jonno admin-ke message koro.",
+    "support_text": "Support er jonno niche Message Support Admin button tap koro.",
+    "support_contact_url": SUPPORT_CONTACT_URL,
     "buy_text": "Package select koro, bKash/Nagad-e payment koro, tarpor Transaction ID submit koro. Admin verify korle credits auto add hobe.",
     "admin_notice": "Please call only people who have agreed to receive the call.",
     "packages": [
@@ -520,7 +522,8 @@ def ensure_user(tg_user, referrer_id: Optional[int] = None, referral_eligible: b
                     try:
                         add_credits(tg_user.id, signup_bonus, "welcome_bonus", f"signup:{tg_user.id}")
                     except ValueError as exc:
-                        if "already recorded" not in str(exc).lower():
+                        message = str(exc).lower()
+                        if not any(token in message for token in ("already recorded", "record already exists", "already exists", "already applied", "duplicate", "duplicate credit operation")):
                             raise
                 ref.update({"first_start_credit_claimed": True, "welcome_credit_pending": False})
             return ref.get().to_dict() or {}
@@ -533,7 +536,8 @@ def ensure_user(tg_user, referrer_id: Optional[int] = None, referral_eligible: b
             try:
                 add_credits(tg_user.id, signup_bonus, "welcome_bonus", f"signup:{tg_user.id}")
             except ValueError as exc:
-                if "already recorded" not in str(exc).lower():
+                message = str(exc).lower()
+                if not any(token in message for token in ("already recorded", "record already exists", "already exists", "already applied", "duplicate", "duplicate credit operation")):
                     raise
             ref.update({"first_start_credit_claimed": True, "welcome_credit_pending": False})
         else:
@@ -558,7 +562,7 @@ def add_credits(user_id: int, amount: float, reason: str, reference: str = "") -
     ledger_ref = ledger_ref_for(user_id, reason, reference)
     with _TRANSACTION_LOCK:
         if ledger_ref.get().exists:
-            raise ValueError("This credit operation was already recorded. No duplicate credit was added.")
+            raise ValueError("Duplicate credit operation blocked; this request was already applied.")
         transaction = db.transaction()
         @firestore.transactional
         def apply(transaction):
@@ -586,7 +590,7 @@ def deduct_credits(user_id: int, amount: float, reason: str, reference: str = ""
     ledger_ref = ledger_ref_for(user_id, reason, reference)
     with _TRANSACTION_LOCK:
         if ledger_ref.get().exists:
-            raise ValueError("This credit operation was already recorded. No duplicate deduction was made.")
+            raise ValueError("Duplicate deduction operation blocked; this request was already applied.")
         transaction = db.transaction()
         @firestore.transactional
         def apply(transaction):
@@ -598,7 +602,10 @@ def deduct_credits(user_id: int, amount: float, reason: str, reference: str = ""
             if before < amount:
                 raise ValueError("Insufficient credits.")
             after = credits_float(before - amount)
-            transaction.update(ref, {"balance": after, "updated_at": now()})
+            updates = {"balance": after, "updated_at": now()}
+            if after <= 0:
+                updates.update({"subscription_tier": "INACTIVE", "subscription_exhausted": True, "subscription_ended_at": now()})
+            transaction.update(ref, updates)
             transaction.create(ledger_ref, {
                 "user_id": user_id, "type": reason, "amount": -amount,
                 "before": before, "after": after,
@@ -608,7 +615,16 @@ def deduct_credits(user_id: int, amount: float, reason: str, reference: str = ""
         return apply(transaction)
 
 def refund_credits(user_id: int, amount: float, reason: str, reference: str = "") -> float:
-    return add_credits(user_id, amount, reason, reference)
+    after = add_credits(user_id, amount, reason, reference)
+    user = get_user(user_id)
+    paid_tier = clean_text(user.get("subscription_paid_tier", "INACTIVE"), 30).upper()
+    if after > 0 and paid_tier not in {"", "INACTIVE"} and reason.startswith("call_refund"):
+        user_ref(user_id).update({
+            "subscription_tier": paid_tier,
+            "subscription_exhausted": False,
+            "updated_at": now(),
+        })
+    return after
 
 
 def is_admin(user_id: int) -> bool:
@@ -690,7 +706,8 @@ async def complete_pending_referral(user_id: int):
         try:
             add_credits(referrer_id, bonus, "referral_bonus", f"new_user:{_safe_int(user_id)}")
         except ValueError as exc:
-            if "already recorded" not in str(exc).lower():
+            message = str(exc).lower()
+            if not any(token in message for token in ("already recorded", "record already exists", "already exists", "already applied", "duplicate", "duplicate credit operation")):
                 raise
         current = referrer_ref.get().to_dict() or {}
         new_referrals = (_safe_int(current.get("referrals", 0)) or 0) + 1
@@ -751,22 +768,55 @@ def format_balance(value: Any) -> str:
     return f"{credits_float(value):.2f}"
 
 
+def subscription_tier_for_price(price: Any) -> str:
+    """Tier is based on the verified paid package, not unverified user input."""
+    try:
+        price_value = float(price)
+    except (TypeError, ValueError):
+        price_value = 0.0
+    if price_value >= 380:
+        return "LEGEND"
+    if price_value >= 240:
+        return "ELITE"
+    if price_value >= 180:
+        return "VIP"
+    if price_value >= 100:
+        return "MAX"
+    if price_value >= 50:
+        return "PRO"
+    return "ACTIVE" if price_value > 0 else "INACTIVE"
+
+
+def subscription_for_profile(user_data: dict) -> str:
+    balance = credits_float(user_data.get("balance", 0))
+    tier = clean_text(user_data.get("subscription_tier", "INACTIVE"), 30).upper() or "INACTIVE"
+    if balance <= 0 or bool(user_data.get("subscription_exhausted", False)):
+        return "INACTIVE"
+    return tier if tier != "INACTIVE" else "INACTIVE"
+
+
 def main_keyboard(user_id: int):
     rows = [
-        [InlineKeyboardButton("📞 Send Call", callback_data="menu:call"), InlineKeyboardButton("👤 My Profile", callback_data="menu:profile")],
-        [InlineKeyboardButton("👥 Refer", callback_data="menu:refer"), InlineKeyboardButton("📊 LP Statistics", callback_data="menu:stats")],
-        [InlineKeyboardButton("💰 Buy Credits", callback_data="menu:buy"), InlineKeyboardButton("🎁 Redeem", callback_data="menu:redeem")],
-        [InlineKeyboardButton("🕘 Call History", callback_data="menu:history"), InlineKeyboardButton("☎️ Support", callback_data="menu:support")],
+        [KeyboardButton("📞 Send Call", style="success"), KeyboardButton("👤 My Profile", style="primary")],
+        [KeyboardButton("👥 Refer", style="primary"), KeyboardButton("📊 LP Statistics", style="primary")],
+        [KeyboardButton("💰 Buy Credits", style="success"), KeyboardButton("🎁 Redeem", style="danger")],
+        [KeyboardButton("🕘 Call History", style="primary")],
+        [KeyboardButton("☎️ Support", style="danger")],
     ]
     settings = get_settings()
     if settings.get("daily_bonus_enabled", False):
-        rows.append([InlineKeyboardButton("🎁 Daily Bonus", callback_data="daily:claim")])
+        rows.append([KeyboardButton("🎁 Daily Bonus", style="success")])
     if is_admin(user_id):
-        rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin:menu")])
-    return InlineKeyboardMarkup(rows)
+        rows.append([KeyboardButton("🛠 Admin Panel", style="danger")])
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Select a menu option",
+    )
 
 def back_button():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu:home")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu:home", style="primary")]])
 
 
 async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -807,7 +857,7 @@ async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_settings()
     notice = settings.get("admin_notice", "")
     text = (
-        f"✨ *{clean_text(settings.get('brand_name', 'Custom Call'), 60)}*\n\n"
+        f"✨ *{escape_markdown(clean_text(settings.get('brand_name', 'Custom Call'), 60), version=1)}*\n\n"
         f"💳 Balance: *{format_balance(data.get('balance', 0))} credits*\n"
         f"📞 Total Calls: *{_safe_int(data.get('total_calls', 0)) or 0}*\n"
         f"👥 Referrals: *{_safe_int(data.get('referrals', 0)) or 0}*\n\n"
@@ -816,14 +866,36 @@ async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if settings.get("maintenance") and not is_admin(tg_user.id):
         text += "\n\n🛠 Service maintenance-e ache."
     if notice:
-        text += f"\n\nℹ️ {clean_text(notice, 500)}"
+        text += f"\n\nℹ️ {escape_markdown(clean_text(notice, 500), version=1)}"
     await message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard(tg_user.id))
 
+def strip_markdown_for_fallback(text: str) -> str:
+    value = str(text or "")
+    value = re.sub(r"\\([_*`\[\]()>#+=|{}.!-])", r"\1", value)
+    value = value.replace("`", "").replace("*", "").replace("_", "")
+    return value
+
+
 async def edit_or_send(query, text: str, markup=None, parse_mode="Markdown"):
+    # Reply keyboards belong to a new chat message; Telegram rejects them in editMessageText.
+    if isinstance(markup, ReplyKeyboardMarkup):
+        try:
+            await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=markup)
+            return
+        except Exception:
+            await query.message.reply_text(strip_markdown_for_fallback(text), reply_markup=markup)
+            return
     try:
         await query.edit_message_text(text, parse_mode=parse_mode, reply_markup=markup)
+        return
     except Exception:
+        pass
+    try:
         await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=markup)
+        return
+    except Exception:
+        # Last-resort plain text fallback prevents parse-entity errors from hiding the response.
+        await query.message.reply_text(strip_markdown_for_fallback(text), reply_markup=markup)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -871,7 +943,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu:profile":
         u = get_user(user_id)
-        text = ("👤 *My Profile*\n\n" f"ID: `{user_id}`\n" f"Name: {escape_markdown(clean_text((u.get('first_name','') + ' ' + u.get('last_name','')).strip() or 'User',100), version=1)}\n" f"Username: @{escape_markdown(u.get('username') or 'none', version=1)}\n" f"Balance: *{format_balance(u.get('balance', 0))} credits*\n" f"Total Calls: *{_safe_int(u.get('total_calls', 0)) or 0}*\n" f"Successful: *{_safe_int(u.get('successful_calls', 0)) or 0}*\n" f"Failed: *{_safe_int(u.get('failed_calls', 0)) or 0}*\n" f"Total Seconds: *{_safe_int(u.get('total_seconds', 0)) or 0}*\n" f"Referrals: *{_safe_int(u.get('referrals', 0)) or 0}*")
+        sub_tier = subscription_for_profile(u)
+        text = ("👤 *My Profile*\n\n" f"ID: `{user_id}`\n" f"Name: {escape_markdown(clean_text((u.get('first_name','') + ' ' + u.get('last_name','')).strip() or 'User',100), version=1)}\n" f"Username: @{escape_markdown(u.get('username') or 'none', version=1)}\n" f"Balance: *{format_balance(u.get('balance', 0))} credits*\n" f"Subscription: *{sub_tier}*\n" f"Total Calls: *{_safe_int(u.get('total_calls', 0)) or 0}*\n" f"Successful: *{_safe_int(u.get('successful_calls', 0)) or 0}*\n" f"Failed: *{_safe_int(u.get('failed_calls', 0)) or 0}*\n" f"Total Seconds: *{_safe_int(u.get('total_seconds', 0)) or 0}*\n" f"Referrals: *{_safe_int(u.get('referrals', 0)) or 0}*")
         await edit_or_send(query, text, back_button())
         return
 
@@ -886,13 +959,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu:stats":
         settings = get_settings()
         totals = await local_stats()
-        lines = ["📊 *LP Statistics*\n", f"Users: *{totals['users']}*", f"Total Calls: *{totals['calls']}*", f"Successful Calls: *{totals['success']}*", f"Failed Calls: *{totals['failed']}*", f"Credits in Circulation: *{format_balance(totals['credits'])}*", f"Daily Call Limit: *{int(settings.get('daily_call_limit', 20))}*"]
-        if totals.get("top_users"):
-            lines += ["", "🏆 *Top Credit Holders*"]
-            for rank, item in enumerate(totals["top_users"], 1):
-                # Deliberately show display name only; never show username here.
+        daily_limit = _safe_int(settings.get("daily_call_limit", 20))
+        lines = [
+            "📊 *LP Statistics*", "",
+            f"Users: *{totals['users']}*",
+            f"Total Calls: *{totals['calls']}*",
+            f"Successful Calls: *{totals['success']}*",
+            f"Failed Calls: *{totals['failed']}*",
+            "", "🏆 *Top Credit Holders*",
+        ]
+        top_users = [item for item in totals.get("top_users", []) if credits_float(item.get("balance", 0)) > 0][:5]
+        if top_users:
+            for rank, item in enumerate(top_users, 1):
                 name = escape_markdown(item.get("name") or "User", version=1)
                 lines.append(f"{rank}. {name} — *{format_balance(item.get('balance', 0))} credits*")
+        else:
+            lines.append("No credit holders yet.")
         await edit_or_send(query, "\n".join(lines), back_button())
         return
 
@@ -908,14 +990,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = str(c.get("status", "unknown")).upper()
             number = str(c.get("number", ""))[-4:]
             when = iso(c.get("created_at")) or "-"
-            lines.append(f"• `****{number}` — *{status}* — {when[:16]}")
+            safe_status = escape_markdown(status, version=1)
+            lines.append(f"• `****{number}` — *{safe_status}* — {when[:16]}")
             if c.get("recording_url"):
-                lines.append(f"  Recording: {clean_text(c.get('recording_url'), 300)}")
+                lines.append(f"  Recording: `{escape_markdown(clean_text(c.get('recording_url'), 300), version=1)}`")
         await edit_or_send(query, "\n".join(lines), back_button())
         return
 
     if data == "menu:support":
-        await edit_or_send(query, f"☎️ *Support*\n\n{clean_text(get_settings().get('support_text', 'Support-er jonno admin-ke message koro.'), 1800)}", back_button())
+        support_url = clean_text(get_settings().get("support_contact_url") or SUPPORT_CONTACT_URL, 300)
+        support_text = clean_text(get_settings().get("support_text", "Support er jonno admin-ke message koro."), 1800)
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✉️ Message Support Admin", url=support_url, style="primary")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="menu:home", style="primary")],
+        ])
+        await edit_or_send(query, f"☎️ *Support*\n\n{support_text}\n\nAdmin ID: `{ADMIN_ID}`", markup)
         return
     if data == "menu:buy":
         await show_buy(query, context)
@@ -932,8 +1021,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_send(query, "🎁 *Redeem Code*\n\nYour redeem code pathao.", back_button())
         return
     if data == "menu:call":
+        call_settings = get_settings()
+        if call_settings.get("maintenance", False):
+            await edit_or_send(query, "🛠 Call maintenance ON ache. Ekhon call temporarily disabled; other features cholbe.", back_button())
+            return
         u = get_user(user_id)
-        cost = credits_float(get_settings().get("call_credit_cost", 1))
+        cost = credits_float(call_settings.get("call_credit_cost", 1))
         if credits_float(u.get("balance", 0)) <= 0 or credits_float(u.get("balance", 0)) < cost:
             await edit_or_send(query, f"❌ Call dite credit lagbe. Required: *{cost:g} credits*. Buy Credits ba Redeem use koro.", back_button())
             return
@@ -986,8 +1079,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_buy(query, context):
     settings = get_settings()
     packages = settings.get("packages", [])
-    rows = [[InlineKeyboardButton(clean_text(p.get("label", f"{p.get('credits')} Calls"), 60), callback_data=f"buy:{p.get('id')}")] for p in packages]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:home")])
+    rows = [[InlineKeyboardButton(clean_text(p.get("label", f"{p.get('credits')} Calls"), 60), callback_data=f"buy:{p.get('id')}", style="success" if i % 2 == 0 else "primary")] for i, p in enumerate(packages)]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:home", style="primary")])
     bkash = clean_text(settings.get("bkash_number", ""), 40) or "Not set"
     nagad = clean_text(settings.get("nagad_number", ""), 40) or "Not set"
     package_lines = "\n".join(f"• {clean_text(pkg.get('label'), 100)}" for pkg in packages)
@@ -1030,9 +1123,9 @@ async def select_package(query, context, pkg_id: str):
     context.user_data["payment_package"] = package
     methods = []
     if clean_text(settings.get("bkash_number"), 40):
-        methods.append([InlineKeyboardButton("💗 Pay with bKash", callback_data="paymethod:bkash")])
+        methods.append([InlineKeyboardButton("💗 Pay with bKash", callback_data="paymethod:bkash", style="success")])
     if clean_text(settings.get("nagad_number"), 40):
-        methods.append([InlineKeyboardButton("🧡 Pay with Nagad", callback_data="paymethod:nagad")])
+        methods.append([InlineKeyboardButton("🧡 Pay with Nagad", callback_data="paymethod:nagad", style="primary")])
     methods.append([InlineKeyboardButton("⬅️ Cancel", callback_data="menu:buy")])
     if len(methods) == 1:
         await edit_or_send(query, "❌ Admin ekhono kono payment number set koreni.", back_button())
@@ -1059,6 +1152,133 @@ async def select_payment_method(query, context, method: str):
     context.user_data["state"] = "payment_txn"
     await edit_or_send(query, f"💳 *{method.title()} Payment*\n\nSend money to: `{number}`\nPackage: *{clean_text(package.get('label'),100)}*\nAmount: *{int(package.get('price',0))} TK*\n\nPayment complete kore Transaction ID pathao. Same Transaction ID second time accept hobe na.", back_button())
 
+async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    user_id = user.id
+    settings = get_settings()
+    keyboard = main_keyboard(user_id)
+
+    if label == "📞 Send Call":
+        if settings.get("maintenance", False):
+            await message.reply_text("🛠 Call maintenance ON ache. Ekhon call temporarily disabled; onno feature cholbe.", reply_markup=keyboard)
+            return
+        balance = credits_float(get_user(user_id).get("balance", 0))
+        cost = credits_float(settings.get("call_credit_cost", 1))
+        if balance <= 0 or balance < cost:
+            await message.reply_text(f"❌ Call dite credit lagbe. Required: {cost:g}; current balance: {balance:g}. Buy Credits ba Redeem use koro.", reply_markup=keyboard)
+            return
+        context.user_data["state"] = "call_phone"
+        await message.reply_text("📞 Send Call\nDestination phone number pathao. Example: 01700000000", reply_markup=keyboard)
+        return
+
+    if label == "👤 My Profile":
+        data = get_user(user_id)
+        name = (str(data.get("first_name", "")) + " " + str(data.get("last_name", ""))).strip() or "User"
+        text = (
+            "👤 MY PROFILE\n━━━━━━━━━━━━━━━━━\n"
+            f"Name: {name}\nTelegram ID: {user_id}\nUsername: @{data.get('username') or 'none'}\n"
+            f"Balance: {format_balance(data.get('balance', 0))} credits\n"
+            f"Subscription: {subscription_for_profile(data)}\n"
+            f"Total Calls: {_safe_int(data.get('total_calls', 0)) or 0}\n"
+            f"Successful Calls: {_safe_int(data.get('successful_calls', 0)) or 0}\n"
+            f"Failed Calls: {_safe_int(data.get('failed_calls', 0)) or 0}\n"
+            f"Referrals: {_safe_int(data.get('referrals', 0)) or 0}"
+        )
+        await message.reply_text(text, reply_markup=keyboard)
+        return
+
+    if label == "👥 Refer":
+        me = await context.bot.get_me()
+        referral_link = f"https://t.me/{me.username}?start=ref_{user_id}"
+        bonus = credits_float(settings.get("referral_bonus", 1))
+        await message.reply_text(
+            "👥 REFERRAL PROGRAM\n━━━━━━━━━━━━━━━━━\n"
+            f"Referral Bonus: {bonus:g} Credit(s)\n"
+            f"Link share koro ar {bonus:g} credit jite nao!\n\n"
+            f"Your referral link:\n{referral_link}\n\n"
+            "Bonus pabe only eligible new users-er jonno. Jara age theke/age required channel member chilo, tader referral count hobe na.",
+            reply_markup=keyboard,
+        )
+        return
+
+    if label == "📊 LP Statistics":
+        totals = await local_stats()
+        lines = [
+            "📊 LP Statistics", "━━━━━━━━━━━━━━━━━",
+            f"Users: {totals['users']}",
+            f"Total Calls: {totals['calls']}",
+            f"Successful Calls: {totals['success']}",
+            f"Failed Calls: {totals['failed']}",
+            "", "🏆 Top Credit Holders",
+        ]
+        top_users = [item for item in totals.get("top_users", []) if credits_float(item.get("balance", 0)) > 0]
+        if not top_users:
+            lines.append("No credit holders yet.")
+        else:
+            for rank, item in enumerate(top_users, 1):
+                lines.append(f"{rank}. {item.get('name') or 'User'} — {format_balance(item.get('balance', 0))} credits")
+        await message.reply_text("\n".join(lines), reply_markup=keyboard)
+        return
+
+    if label == "💰 Buy Credits":
+        packages = settings.get("packages", [])
+        rows = [[InlineKeyboardButton(clean_text(pkg.get("label", f"{pkg.get('credits')} Calls"), 60), callback_data=f"buy:{pkg.get('id')}", style="success" if i % 2 == 0 else "primary")] for i, pkg in enumerate(packages)]
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:home", style="primary")])
+        package_lines = "\n".join(f"• {clean_text(pkg.get('label'), 100)}" for pkg in packages)
+        text = (
+            "💰 Credit Purchase\n━━━━━━━━━━━━━━━━━\n\n"
+            "📦 Available Packages:\n\n" + package_lines + "\n━━━━━━━━━━━━━━━━━\n"
+            f"💳 bKash: {clean_text(settings.get('bkash_number') or 'Not set', 40)}\n"
+            f"💳 Nagad: {clean_text(settings.get('nagad_number') or 'Not set', 40)}\n"
+            "⚡ Admin approve korle credits auto add hobe.\n\n👇 Nicher package select koro:"
+        )
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if label == "🎁 Redeem":
+        context.user_data["state"] = "redeem_code"
+        await message.reply_text("🎁 Redeem Code\nTomar redeem code pathao.", reply_markup=keyboard)
+        return
+
+    if label == "🕘 Call History":
+        docs = list(db.collection(COL_CALLS).where("user_id", "==", user_id).limit(50).stream())
+        docs.sort(key=lambda snap: str((snap.to_dict() or {}).get("created_at") or ""), reverse=True)
+        if not docs:
+            await message.reply_text("📞 Call History\nKono call history nei.", reply_markup=keyboard)
+            return
+        lines = ["📞 Recent Calls"]
+        for snap in docs[:10]:
+            record = snap.to_dict() or {}
+            number = str(record.get("number", ""))[-4:]
+            lines.append(f"• ****{number} — {str(record.get('status', 'unknown')).upper()} — {iso(record.get('created_at')) or '-'}")
+        await message.reply_text("\n".join(lines), reply_markup=keyboard)
+        return
+
+    if label == "☎️ Support":
+        support_url = clean_text(settings.get("support_contact_url") or SUPPORT_CONTACT_URL, 300)
+        support_text = clean_text(settings.get("support_text", "Support er jonno admin-ke message koro."), 1800)
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("✉️ Message Support Admin", url=support_url, style="primary")]])
+        await message.reply_text(f"☎️ Support\n{support_text}\nAdmin ID: {ADMIN_ID}", reply_markup=markup)
+        return
+
+    if label == "🎁 Daily Bonus":
+        try:
+            after = claim_daily_credit(user_id)
+            await message.reply_text(f"🎁 Daily bonus claimed: +{credits_float(settings.get('daily_bonus', 0)):g} credits. New balance: {after:g}", reply_markup=main_keyboard(user_id))
+        except Exception as exc:
+            await message.reply_text(f"ℹ️ {clean_text(exc, 300)}", reply_markup=keyboard)
+        return
+
+    if label == "🛠 Admin Panel" and is_admin(user_id):
+        await message.reply_text("🛠 Admin Panel — choose an operation:", reply_markup=admin_keyboard_markup())
+        return
+
+    await message.reply_text("Dashboard theke ekta option select koro.", reply_markup=keyboard)
+
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.effective_message:
         return
@@ -1072,8 +1292,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_message.reply_text("⛔ Your account is blocked. Support-er sathe contact koro.")
         return
 
-    state = context.user_data.get("state")
     text = clean_text(update.effective_message.text, 4000)
+    dashboard_labels = {
+        "📞 Send Call", "👤 My Profile", "👥 Refer", "📊 LP Statistics",
+        "💰 Buy Credits", "🎁 Redeem", "🕘 Call History", "☎️ Support",
+        "🎁 Daily Bonus", "🛠 Admin Panel",
+    }
+    if text in dashboard_labels:
+        context.user_data.clear()
+        await handle_dashboard_button(update, context, text)
+        return
+    state = context.user_data.get("state")
     if is_admin(user_id) and state and state.startswith("admin_"):
         await handle_admin_state(update, context, text)
         return
@@ -1097,10 +1326,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["call_phone"] = phone
         context.user_data["state"] = "call_mode"
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 Text to Speech", callback_data="callmode:text")],
-            [InlineKeyboardButton("🔗 Audio URL", callback_data="callmode:audio_url")],
-            [InlineKeyboardButton("🎧 Upload Audio", callback_data="callmode:audio_upload")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="call:cancel")],
+            [InlineKeyboardButton("📝 Text to Speech", callback_data="callmode:text", style="success")],
+            [InlineKeyboardButton("🔗 Audio URL", callback_data="callmode:audio_url", style="primary")],
+            [InlineKeyboardButton("🎧 Upload Audio", callback_data="callmode:audio_upload", style="primary")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="call:cancel", style="danger")],
         ])
         await update.effective_message.reply_text(f"📞 Number: `****{phone[-4:]}`\n\nCall audio method select koro.", parse_mode="Markdown", reply_markup=markup)
         return
@@ -1132,15 +1361,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def ask_call_time(update: Update):
     markup = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("30s", callback_data="calltime:30"),
-            InlineKeyboardButton("60s", callback_data="calltime:60"),
-            InlineKeyboardButton("120s", callback_data="calltime:120"),
+            InlineKeyboardButton("30s", callback_data="calltime:30", style="primary"),
+            InlineKeyboardButton("60s", callback_data="calltime:60", style="primary"),
+            InlineKeyboardButton("120s", callback_data="calltime:120", style="primary"),
         ],
         [
-            InlineKeyboardButton("180s", callback_data="calltime:180"),
-            InlineKeyboardButton("300s", callback_data="calltime:300"),
+            InlineKeyboardButton("180s", callback_data="calltime:180", style="primary"),
+            InlineKeyboardButton("300s", callback_data="calltime:300", style="primary"),
         ],
-        [InlineKeyboardButton("❌ Cancel", callback_data="call:cancel")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="call:cancel", style="danger")],
     ])
     await update.effective_message.reply_text("⏱ Choose call duration.", reply_markup=markup)
 
@@ -1219,7 +1448,19 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await status.edit_text("✅ Audio uploaded. Choose the call duration.")
         await ask_call_time(update)
     except Exception as exc:
-        await status.edit_text(f"❌ Audio upload failed: {clean_text(exc, 500)}")
+        error_text = clean_text(exc, 1200)
+        lower_error = error_text.lower()
+        if "specified bucket does not exist" in lower_error or "bucket does not exist" in lower_error or '"code": 404' in lower_error or "notfound" in lower_error:
+            friendly = (
+                "❌ Firebase Storage bucket পাওয়া যায়নি। Firebase Console → Build → Storage → Get started থেকে Storage bucket create/enable koro.\n\n"
+                "Tarpor Console-e je exact bucket name dekhabe seta Render-er FIREBASE_STORAGE_BUCKET-e dao. "
+                "Bucket create na korle upload code diye fix kora jabe na. Service-account-er Storage upload permission-o lagbe."
+            )
+            await status.edit_text(friendly)
+        elif "permission" in lower_error or "forbidden" in lower_error or "403" in lower_error:
+            await status.edit_text("❌ Firebase Storage permission denied. Service account-er Storage Object Creator/Storage Admin permission check koro.")
+        else:
+            await status.edit_text(f"❌ Audio upload failed: {error_text[:500]}")
     finally:
         if temp_path:
             try:
@@ -1235,8 +1476,9 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
     if u.get("is_blocked") and not is_admin(user_id):
         await update.callback_query.message.reply_text("⛔ Your account is blocked.")
         return
-    if settings.get("maintenance") and not is_admin(user_id):
-        await update.callback_query.message.reply_text("🛠 Calls temporarily disabled. pore try koro.")
+    if settings.get("maintenance", False):
+        await update.callback_query.message.reply_text("🛠 Call maintenance ON ache. Ekhon call temporarily disabled; other features cholbe.")
+        context.user_data.clear()
         return
     phone = context.user_data.get("call_phone")
     txt = context.user_data.get("call_text")
@@ -1424,16 +1666,13 @@ async def account_api(endpoint: str) -> dict:
     except Exception:
         return {"status": "error", "message": "Provider API is temporarily unavailable."}
 
-async def claim_daily(query):
-    user_id = query.from_user.id
+def claim_daily_credit(user_id: int) -> float:
     settings = get_settings()
     if not settings.get("daily_bonus_enabled", False):
-        await edit_or_send(query, "🎁 Daily Bonus is currently disabled by admin.", back_button())
-        return
+        raise ValueError("Daily Bonus is currently disabled by admin.")
     bonus = credits_float(settings.get("daily_bonus", 0))
     if bonus <= 0:
-        await edit_or_send(query, "Daily bonus is disabled because its amount is zero.", back_button())
-        return
+        raise ValueError("Daily bonus is disabled because its amount is zero.")
     today = local_day_key()
     ref = user_ref(user_id)
     transaction = db.transaction()
@@ -1459,9 +1698,14 @@ async def claim_daily(query):
         })
         return after
 
+    return claim(transaction)
+
+
+async def claim_daily(query):
+    user_id = query.from_user.id
     try:
-        after = claim(transaction)
-        await edit_or_send(query, f"🎁 Daily bonus claimed: +{bonus:g} credits.\n💳 New balance: {after:g}", back_button())
+        after = claim_daily_credit(user_id)
+        await edit_or_send(query, f"🎁 Daily bonus claimed: +{credits_float(get_settings().get('daily_bonus', 0)):g} credits.\n💳 New balance: {after:g}", back_button())
     except Exception as exc:
         await edit_or_send(query, f"ℹ️ {clean_text(exc, 300)}", back_button())
 
@@ -1534,7 +1778,13 @@ async def redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE, code_i
             f"🎉 Redeemed successfully.\nAdded: +{amount:g} credits."
         )
     except Exception as exc:
-        await update.effective_message.reply_text(f"❌ {clean_text(exc, 800)}")
+        error_text = clean_text(exc, 800)
+        lowered = error_text.lower()
+        if any(token in lowered for token in ("already recorded", "record already exists", "already exists", "duplicate", "already used")):
+            message = "ℹ️ Ei code age redeem hoyeche ba request already process hoyeche. Extra credit add kora hoyni."
+        else:
+            message = f"❌ Redeem failed: {error_text}"
+        await update.effective_message.reply_text(message, reply_markup=main_keyboard(user_id))
 
 
 async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_TYPE, txn_id: str):
@@ -1590,7 +1840,7 @@ async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_T
         f"📱 Payment Number: `{clean_text(number,40)}`\n🧾 Transaction ID: `{txn_id}`\n"
         "━━━━━━━━━━━━━━━━━\nVerify payment manually before approval. Credits will be added only once."
     )
-    review_markup = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve & Add Credits", callback_data=f"pay:approve:{ref.id}"), InlineKeyboardButton("❌ Reject", callback_data=f"pay:reject:{ref.id}")]])
+    review_markup = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve & Add Credits", callback_data=f"pay:approve:{ref.id}", style="success"), InlineKeyboardButton("❌ Reject", callback_data=f"pay:reject:{ref.id}", style="danger")]])
     review_chat = clean_text(settings.get("payment_review_chat_id") or PAYMENT_REVIEW_CHAT_ID, 100)
     notified = False
     try:
@@ -1603,8 +1853,12 @@ async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_T
             await context.bot.send_message(ADMIN_ID, f"⚠️ Payment request {ref.id} group-e post hoyni. Review group/bot permissions check koro.")
         except Exception:
             pass
-    confirmation = f"✅ Payment request saved.\n🆔 Request ID: `{ref.id}`\n" + ("📨 @ffxemon review group-e pathano hoyeche. Admin approve korle credits auto add hobe." if notified else "⚠️ Database-e save hoyeche but review group-e pathano jayni. Admin-ke notify kora hoyeche.")
-    await update.effective_message.reply_text(confirmation, parse_mode="Markdown", reply_markup=main_keyboard(user_id))
+    confirmation = (
+        "✅ Payment request saved.\n"
+        f"🆔 Request ID: {ref.id}\n"
+        "⏳ Payment verification pending. Admin approve korle credits auto add hobe."
+    )
+    await update.effective_message.reply_text(confirmation, reply_markup=main_keyboard(user_id))
 
 async def local_stats() -> dict:
     user_docs = list(db.collection(COL_USERS).stream())
@@ -1623,25 +1877,32 @@ async def local_stats() -> dict:
     failed = sum(1 for status in statuses if status == "failed")
     return {
         "users": len(valid_users), "calls": len(calls), "success": success, "failed": failed,
-        "credits": credits, "top_users": sorted(valid_users, key=lambda item: item["balance"], reverse=True)[:5],
+        "credits": credits,
+        "top_users": sorted([item for item in valid_users if item["balance"] > 0], key=lambda item: item["balance"], reverse=True)[:5],
     }
 
-async def admin_menu(query):
+def admin_keyboard_markup():
     settings = get_settings()
     daily_state = "ON ✅" if settings.get("daily_bonus_enabled", False) else "OFF ⛔"
     rows = [
-        [InlineKeyboardButton("📈 Overview", callback_data="admin:overview"), InlineKeyboardButton("👥 Users", callback_data="admin:users")],
-        [InlineKeyboardButton("💳 Add Credits", callback_data="admin:addcredits"), InlineKeyboardButton("➖ Deduct Credits", callback_data="admin:deductcredits")],
-        [InlineKeyboardButton("🚫 Block User", callback_data="admin:block"), InlineKeyboardButton("✅ Unblock User", callback_data="admin:unblock")],
-        [InlineKeyboardButton("🎁 Create Redeem", callback_data="admin:createcode"), InlineKeyboardButton("📜 Redeem Codes", callback_data="admin:codes")],
-        [InlineKeyboardButton("💰 Payments", callback_data="admin:payments"), InlineKeyboardButton("📞 Call Logs", callback_data="admin:calls")],
-        [InlineKeyboardButton("📣 Broadcast", callback_data="admin:broadcast"), InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings")],
-        [InlineKeyboardButton("💗 bKash Number", callback_data="admin:bkash_number"), InlineKeyboardButton("🧡 Nagad Number", callback_data="admin:nagad_number")],
-        [InlineKeyboardButton(f"🎁 Daily Bonus: {daily_state}", callback_data="admin:toggle_daily")],
-        [InlineKeyboardButton("🔌 Provider", callback_data="admin:provider"), InlineKeyboardButton("🛡 Safety", callback_data="admin:safety")],
-        [InlineKeyboardButton("⬅️ Home", callback_data="menu:home")],
+        [InlineKeyboardButton("📈 Overview", callback_data="admin:overview", style="primary"), InlineKeyboardButton("👥 Users", callback_data="admin:users", style="primary")],
+        [InlineKeyboardButton("💳 Add Credits", callback_data="admin:addcredits", style="success"), InlineKeyboardButton("➖ Deduct Credits", callback_data="admin:deductcredits", style="danger")],
+        [InlineKeyboardButton("🚫 Block User", callback_data="admin:block", style="danger"), InlineKeyboardButton("✅ Unblock User", callback_data="admin:unblock", style="success")],
+        [InlineKeyboardButton("🎁 Create Redeem", callback_data="admin:createcode", style="success"), InlineKeyboardButton("📜 Redeem Codes", callback_data="admin:codes", style="primary")],
+        [InlineKeyboardButton("💰 Payments", callback_data="admin:payments", style="success"), InlineKeyboardButton("📞 Call Logs", callback_data="admin:calls", style="primary")],
+        [InlineKeyboardButton("📣 Broadcast", callback_data="admin:broadcast", style="primary"), InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings", style="primary")],
+        [InlineKeyboardButton("💗 bKash Number", callback_data="admin:bkash_number", style="success"), InlineKeyboardButton("🧡 Nagad Number", callback_data="admin:nagad_number", style="danger")],
+        [InlineKeyboardButton(f"🎁 Daily Bonus: {daily_state}", callback_data="admin:toggle_daily", style="success" if settings.get("daily_bonus_enabled", False) else "danger")],
+        [InlineKeyboardButton(f"🛠 Call Maintenance: {'ON' if settings.get('maintenance', False) else 'OFF'}", callback_data="admin:toggle_maintenance", style="danger" if settings.get("maintenance", False) else "success")],
+        [InlineKeyboardButton("📦 Edit Packages", callback_data="admin:packages", style="primary"), InlineKeyboardButton("🔎 User Info", callback_data="admin:userinfo", style="primary")],
+        [InlineKeyboardButton("🔌 Provider", callback_data="admin:provider", style="primary"), InlineKeyboardButton("🛡 Safety", callback_data="admin:safety", style="danger")],
+        [InlineKeyboardButton("⬅️ Home", callback_data="menu:home", style="primary")],
     ]
-    await edit_or_send(query, "🛠 *Admin Panel*\n\nCredit, payment, user, referral, bonus, and call settings manage koro.", InlineKeyboardMarkup(rows))
+    return InlineKeyboardMarkup(rows)
+
+
+async def admin_menu(query):
+    await edit_or_send(query, "🛠 *Admin Panel*\n\nCredit, payment, user, referral, bonus, and call settings manage koro.", admin_keyboard_markup())
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1668,7 +1929,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for snap in users:
             u = snap.to_dict() or {}
             lines.append(
-                f"• `{u.get('user_id')}` — @{u.get('username') or 'none'} — {format_balance(u.get('balance', 0))}"
+                f"• `{u.get('user_id')}` — @{escape_markdown(clean_text(u.get('username') or 'none', 100), version=1)} — {format_balance(u.get('balance', 0))}"
             )
         await edit_or_send(query, "\n".join(lines), back_button())
     elif action == "addcredits":
@@ -1727,8 +1988,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Credits: *{credits_float(p.get('credits', 0)):g}*\n\n"
             )
             rows.append([
-                InlineKeyboardButton(f"✅ {str(p.get('user_id'))}", callback_data=f"pay:approve:{s.id}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"pay:reject:{s.id}"),
+                InlineKeyboardButton(f"✅ {str(p.get('user_id'))}", callback_data=f"pay:approve:{s.id}", style="success"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"pay:reject:{s.id}", style="danger"),
             ])
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:menu")])
         await edit_or_send(query, text, InlineKeyboardMarkup(rows))
@@ -1747,6 +2008,24 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "broadcast":
         context.user_data["state"] = "admin_broadcast"
         await edit_or_send(query, "📣 Send the message to broadcast to all users.", back_button())
+    elif action == "toggle_maintenance":
+        settings = get_settings()
+        enabled = not bool(settings.get("maintenance", False))
+        save_settings({"maintenance": enabled})
+        audit("maintenance_toggled", query.from_user.id, {"enabled": enabled})
+        status_label = "ON — calls disabled" if enabled else "OFF — calls enabled"
+        await edit_or_send(query, f"🛠 Call maintenance: *{status_label}*. Other features will remain available.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin:menu", style="primary")]]))
+    elif action == "packages":
+        packages = get_settings().get("packages", [])
+        lines = ["📦 *Package Setup*", "", "Current packages:"]
+        for pkg in packages:
+            lines.append(f"{clean_text(pkg.get('id'), 20)} — {credits_float(pkg.get('credits', 0)):g} credits — {int(pkg.get('price', 0))} TK")
+        lines += ["", "Send: `PACKAGE_ID PRICE CREDITS`", "Example: `p50 60 50`"]
+        context.user_data["state"] = "admin_package"
+        await edit_or_send(query, "\n".join(lines), back_button())
+    elif action == "userinfo":
+        context.user_data["state"] = "admin_userinfo"
+        await edit_or_send(query, "🔎 Send numeric Telegram USER_ID or private CHAT_ID.", back_button())
     elif action == "settings":
         s = get_settings()
         text = (
@@ -1768,7 +2047,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💗 Set bKash Number", callback_data="admin:bkash_number")],
             [InlineKeyboardButton("🧡 Set Nagad Number", callback_data="admin:nagad_number")],
             [InlineKeyboardButton("🎁 Toggle Daily Bonus", callback_data="admin:toggle_daily")],
-            [InlineKeyboardButton("⬅️ Back to Admin", callback_data="admin:menu")],
+            [InlineKeyboardButton("⬅️ Back to Admin", callback_data="admin:menu", style="primary")],
         ]
         await edit_or_send(query, text, InlineKeyboardMarkup(rows))
     elif action in {"paymentnumber", "bkash_number", "nagad_number"}:
@@ -1853,7 +2132,17 @@ async def admin_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
                 if amount <= 0:
                     raise ValueError("Invalid credit amount.")
                 new_balance = credits_float(current_balance + amount)
-                transaction.update(user_document, {"balance": new_balance, "updated_at": now()})
+                paid_price = _safe_int(payment.get("price", 0)) or 0
+                new_tier = subscription_tier_for_price(paid_price)
+                transaction.update(user_document, {
+                    "balance": new_balance,
+                    "updated_at": now(),
+                    "subscription_tier": new_tier if new_balance > 0 else "INACTIVE",
+                    "subscription_paid_tier": new_tier,
+                    "subscription_paid_price": paid_price,
+                    "subscription_exhausted": new_balance <= 0,
+                    "subscription_activated_at": now(),
+                })
                 transaction.create(ledger_ref_for(user_id, "purchase", payment_id), {
                     "user_id": user_id, "type": "purchase", "amount": amount,
                     "before": current_balance, "after": new_balance,
@@ -1884,8 +2173,7 @@ async def admin_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
             try:
                 await context.bot.send_message(
                     user_id,
-                    f"✅ *Payment approved!*\n\n📦 Credits added: *+{amount:g}*\n💳 New balance: *{balance_after:g}*",
-                    parse_mode="Markdown",
+                    f"✅ Payment approved!\n\n📦 Credits added: +{amount:g}\n💳 New balance: {balance_after:g}\n⭐ Subscription: {subscription_tier_for_price((db.collection(COL_PAYMENTS).document(payment_id).get().to_dict() or {}).get('price', 0))}",
                     reply_markup=main_keyboard(user_id),
                 )
             except Exception:
@@ -1900,7 +2188,7 @@ async def admin_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("Payment rejected.", show_alert=True)
             final_text = (query.message.text or "Payment request") + f"\n\n❌ REJECTED by {ADMIN_ID}."
         try:
-            await query.edit_message_text(final_text, parse_mode="Markdown", reply_markup=None)
+            await query.edit_message_text(final_text, parse_mode=None, reply_markup=None)
         except Exception:
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
@@ -1986,25 +2274,103 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if state == "admin_createcode":
         parts = text.split()
         if len(parts) != 3:
-            await update.effective_message.reply_text("Format: CREDITS MAX_USES DAYS\nExample: `25 100 30`\nMAX_USES=0 mane unlimited.", parse_mode="Markdown")
+            await update.effective_message.reply_text(
+                "Format: CREDITS MAX_USES DAYS\nExample: 25 100 30\nMAX_USES=0 means unlimited."
+            )
             return
         try:
-            amount = credits_float(parts[0]); max_uses = int(parts[1]); days = int(parts[2])
+            amount = credits_float(parts[0])
+            max_uses = int(parts[1])
+            days = int(parts[2])
             if amount <= 0 or max_uses < 0 or days < 0:
-                raise ValueError
+                raise ValueError("Credits must be positive; MAX_USES and DAYS must be zero or greater.")
             alphabet = string.ascii_uppercase + string.digits
             code = "CALL-" + "".join(secrets.choice(alphabet) for _ in range(10))
             expires = now() + timedelta(days=days) if days else None
-            db.collection(COL_CODES).document().set({
+            code_ref = db.collection(COL_CODES).document()
+            code_ref.set({
                 "code": code, "credits": amount, "max_uses": max_uses, "uses": 0,
                 "used_by": [], "active": True, "expires_at": expires,
                 "created_by": admin_id, "created_at": now(), "updated_at": now(),
             })
-            audit("redeem_code_created", admin_id, {"code": code, "credits": amount, "max_uses": max_uses, "days": days})
-            await update.effective_message.reply_text(f"✅ Redeem code created:\n`{code}`\nCredits: {amount:g}\nMax uses: {'Unlimited' if max_uses == 0 else max_uses}\nExpires: {'Never' if not days else iso(expires)}", parse_mode="Markdown", reply_markup=main_keyboard(admin_id))
+            try:
+                audit("redeem_code_created", admin_id, {"code": code, "credits": amount, "max_uses": max_uses, "days": days, "document_id": code_ref.id})
+            except Exception:
+                pass
+            await update.effective_message.reply_text(
+                "✅ Redeem code created successfully!\n"
+                f"Code: {code}\nCredits: {amount:g}\n"
+                f"Max uses: {'Unlimited' if max_uses == 0 else max_uses}\n"
+                f"Expires: {'Never' if not days else iso(expires)}\n"
+                f"Code record: {code_ref.id}",
+                reply_markup=main_keyboard(admin_id),
+            )
             context.user_data.clear()
-        except Exception:
-            await update.effective_message.reply_text("❌ Invalid values. CREDITS positive, MAX_USES and DAYS zero or greater hote hobe.")
+        except Exception as exc:
+            # Don't hide the actual Firebase/database error behind a misleading "invalid values" response.
+            await update.effective_message.reply_text(
+                f"❌ Redeem code creation failed: {clean_text(exc, 600)}\nPlease retry or check Firebase RTDB permissions."
+            )
+        return
+
+    if state == "admin_package":
+        parts = text.split()
+        if len(parts) != 3:
+            await update.effective_message.reply_text("Format: PACKAGE_ID PRICE CREDITS\nExample: p50 60 50")
+            return
+        package_id = clean_text(parts[0], 20)
+        price = _safe_int(parts[1])
+        credits = credits_float(parts[2])
+        if price is None or price < 1 or credits <= 0:
+            await update.effective_message.reply_text("❌ Price must be positive and credits must be greater than zero.")
+            return
+        settings = get_settings()
+        packages = list(settings.get("packages", []))
+        found = False
+        for package in packages:
+            if str(package.get("id")) == package_id:
+                package["price"] = price
+                package["credits"] = credits
+                package["label"] = f"📞 {credits:g} Calls — {price} TK"
+                found = True
+                break
+        if not found:
+            await update.effective_message.reply_text("❌ Package ID not found. Admin Panel → Edit Packages theke ID dekho.")
+            return
+        save_settings({"packages": packages})
+        audit("package_updated", admin_id, {"package_id": package_id, "price": price, "credits": credits})
+        context.user_data.clear()
+        await update.effective_message.reply_text(f"✅ Package updated: {package_id} — {credits:g} credits — {price} TK", reply_markup=main_keyboard(admin_id))
+        return
+
+    if state == "admin_userinfo":
+        target_id = _safe_int(re.sub(r"^(user_id|userid|chat_id|chatid|user|chat):", "", text.strip(), flags=re.I))
+        if target_id is None or target_id == 0:
+            await update.effective_message.reply_text("❌ Numeric Telegram User ID / Chat ID pathao.")
+            return
+        target_ref = user_ref(target_id)
+        snap = target_ref.get()
+        if not snap.exists:
+            await update.effective_message.reply_text("❌ User record paoa jayni. User-ke bot /start korte bolo.")
+            return
+        user = snap.to_dict() or {}
+        tier = subscription_for_profile(user)
+        details = (
+            "🔎 USER INFO\n\n"
+            f"Name: {clean_text((str(user.get('first_name','')) + ' ' + str(user.get('last_name',''))).strip(), 100) or 'User'}\n"
+            f"Telegram ID: {target_id}\n"
+            f"Username: @{clean_text(user.get('username') or 'none', 100)}\n"
+            f"Balance: {format_balance(user.get('balance', 0))} credits\n"
+            f"Subscription: {tier}\n"
+            f"Total Calls: {_safe_int(user.get('total_calls', 0)) or 0}\n"
+            f"Successful Calls: {_safe_int(user.get('successful_calls', 0)) or 0}\n"
+            f"Failed Calls: {_safe_int(user.get('failed_calls', 0)) or 0}\n"
+            f"Referrals: {_safe_int(user.get('referrals', 0)) or 0}\n"
+            f"Blocked: {bool(user.get('is_blocked', False))}\n"
+            f"Joined: {iso(user.get('created_at')) or 'Unknown'}"
+        )
+        context.user_data.clear()
+        await update.effective_message.reply_text(details, reply_markup=main_keyboard(admin_id))
         return
 
     if state == "admin_broadcast":
@@ -2096,8 +2462,32 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if key == "required_channel" and not value.startswith("@"):
             value = "@" + value.lstrip("/")
-    elif key in {"brand_name", "support_text", "buy_text", "admin_notice"}:
-        value = clean_text(value, 2000)
+    elif key in {"brand_name", "support_text", "buy_text", "admin_notice", "support_contact_url"}:
+        value = clean_text(value, 2000 if key != "support_contact_url" else 300)
+        if key == "support_contact_url" and not (value.startswith("https://") or value.startswith("tg://")):
+            await update.effective_message.reply_text("support_contact_url must start with https:// or tg://")
+            return
+    elif re.fullmatch(r"package_(p50|p100|p200|p300|p500)_(price|credits)", key):
+        try:
+            numeric_value = float(value)
+            if numeric_value <= 0:
+                raise ValueError
+        except Exception:
+            await update.effective_message.reply_text("Package price/credits must be positive.")
+            return
+        package_id, field = key[len("package_"):].rsplit("_", 1)
+        settings = get_settings()
+        packages = list(settings.get("packages", []))
+        target_package = next((pkg for pkg in packages if str(pkg.get("id")) == package_id), None)
+        if not target_package:
+            await update.effective_message.reply_text("Package not found.")
+            return
+        target_package[field] = int(numeric_value) if field == "price" else credits_float(numeric_value)
+        target_package["label"] = f"📞 {credits_float(target_package.get('credits', 0)):g} Calls — {int(target_package.get('price', 0))} TK"
+        save_settings({"packages": packages})
+        audit("package_updated", update.effective_user.id, {"package_id": package_id, field: target_package[field]})
+        await update.effective_message.reply_text(f"✅ Updated {package_id}: {target_package['label']}")
+        return
     else:
         await update.effective_message.reply_text("Unsupported setting. /help dekho.")
         return
@@ -2117,7 +2507,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(uid):
         lines += [
             "🛠 Admin Commands", "/admin — Admin Panel", "/help — This guide",
-            "/addcredits USER_ID_OR_CHAT_ID AMOUNT", "/block USER_ID", "/unblock USER_ID",
+            "/addcredits USER_ID_OR_CHAT_ID AMOUNT", "/block USER_ID", "/unblock USER_ID", "/userinfo USER_ID",
+            "",
+            "Package edit: Admin Panel → Edit Packages → send PACKAGE_ID PRICE CREDITS, e.g. p50 60 50.",
+            "Tier: 50+ TK = PRO, 100+ = MAX, 180+ = VIP, 240+ = ELITE, 380+ = LEGEND. Tier becomes INACTIVE when balance reaches zero.",
             "",
             "⚙️ Settings using /set",
             "/set call_credit_cost 1", "/set daily_call_limit 20", "/set call_cooldown_seconds 15",
@@ -2126,6 +2519,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/set bkash_number 01819202231", "/set nagad_number 01819202231", "/set nagad_number off to disable Nagad",
             "/set payment_review_chat_id @ffxemon", "/set required_channel @CyberShunya_x",
             "/set purchase_limit_count 3", "/set purchase_limit_minutes 10",
+            "/set package_p50_price 60", "/set package_p100_price 100", "/set support_contact_url tg://user?id=7034779471",
             "",
             "Credit add format: numeric Telegram user ID / private chat ID + amount. User must start bot first.",
             "Purchase protection: 3 transaction submission attempts per 10 minutes; invalid and duplicate Transaction IDs count toward the limit.",
@@ -2201,6 +2595,36 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await resolve_admin_target(update, context, "block", context.args[0])
 
 
+async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("Admin only.")
+        return
+    status = await channel_membership_status(context.bot, update.effective_user.id)
+    if status is not True:
+        await show_join_gate(update.effective_message, context, verification_error=status is None)
+        return
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Usage: /userinfo USER_ID_OR_CHAT_ID")
+        return
+    target_id = _safe_int(re.sub(r"^(user_id|userid|chat_id|chatid|user|chat):", "", context.args[0], flags=re.I))
+    if target_id is None:
+        await update.effective_message.reply_text("Numeric Telegram User ID/Chat ID required.")
+        return
+    ref = user_ref(target_id)
+    snap = ref.get()
+    if not snap.exists:
+        await update.effective_message.reply_text("User record not found. User must start the bot first.")
+        return
+    u = snap.to_dict() or {}
+    await update.effective_message.reply_text(
+        f"User Info\nName: {clean_text((str(u.get('first_name','')) + ' ' + str(u.get('last_name',''))).strip(), 100) or 'User'}\n"
+        f"Telegram ID: {target_id}\nUsername: @{clean_text(u.get('username') or 'none', 100)}\n"
+        f"Balance: {format_balance(u.get('balance', 0))} credits\nSubscription: {subscription_for_profile(u)}\n"
+        f"Calls: {_safe_int(u.get('total_calls', 0)) or 0}\nReferrals: {_safe_int(u.get('referrals', 0)) or 0}\n"
+        f"Blocked: {bool(u.get('is_blocked', False))}\nJoined: {iso(u.get('created_at')) or 'Unknown'}"
+    )
+
+
 async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         await update.effective_message.reply_text("Admin only.")
@@ -2229,6 +2653,9 @@ async def call_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_join_gate(update.effective_message, context, verification_error=status is None)
         return
     ensure_user(update.effective_user)
+    if get_settings().get("maintenance", False):
+        await update.effective_message.reply_text("🛠 Call maintenance ON ache. Ekhon call temporarily disabled; other features cholbe.", reply_markup=main_keyboard(uid))
+        return
     if user_blocked(uid):
         await update.effective_message.reply_text("⛔ Your account is blocked. Support-er sathe contact koro.")
         return
@@ -2248,12 +2675,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     try:
+        error_text = clean_text(context.error, 1800) or "Unknown error"
         if telegram_app:
-            await telegram_app.bot.send_message(
-                ADMIN_ID,
-                f"⚠️ Bot error:\n`{clean_text(context.error, 1800)}`",
-                parse_mode="Markdown",
-            )
+            # Plain text is deliberate: exception strings often contain Markdown-reserved characters.
+            await telegram_app.bot.send_message(ADMIN_ID, "⚠️ Bot error:\n" + error_text)
     except Exception:
         pass
 
@@ -2398,6 +2823,7 @@ async def startup():
     telegram_app.add_handler(CommandHandler("addcredits", addcredits_command))
     telegram_app.add_handler(CommandHandler("block", block_command))
     telegram_app.add_handler(CommandHandler("unblock", unblock_command))
+    telegram_app.add_handler(CommandHandler("userinfo", userinfo_command))
     telegram_app.add_handler(ChatMemberHandler(track_channel_membership, ChatMemberHandler.CHAT_MEMBER))
     telegram_app.add_handler(CallbackQueryHandler(callback_handler))
     telegram_app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.ALL, handle_audio_message))
@@ -2406,6 +2832,16 @@ async def startup():
 
     await telegram_app.initialize()
     await telegram_app.start()
+    try:
+        await telegram_app.bot.set_my_commands([
+            BotCommand("start", "Start"),
+            BotCommand("admin", "Admin"),
+            BotCommand("help", "Help"),
+            BotCommand("call", "Send Call"),
+            BotCommand("cancel", "Cancel current action"),
+        ])
+    except Exception:
+        pass
 
     if PUBLIC_BASE_URL:
         webhook_url = f"{PUBLIC_BASE_URL}/telegram/webhook"
