@@ -23,7 +23,7 @@ from firebase_admin import credentials, db as firebase_db, storage
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from telegram import BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from telegram import BotCommand, CopyTextButton, Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
@@ -135,6 +135,10 @@ class _RtdbDocumentReference:
             if self.get().exists:
                 raise ValueError("This operation was already recorded. Duplicate update blocked.")
             self._ref.set(_db_json(data))
+
+    def delete(self):
+        with _TRANSACTION_LOCK:
+            self._ref.delete()
 
 
 class _RtdbQuery:
@@ -271,6 +275,7 @@ if FIREBASE_STORAGE_BUCKET:
 app = FastAPI(title="Custom Call Bot", version="1.0.0")
 
 telegram_app: Optional[Application] = None
+channel_recheck_task: Optional[asyncio.Task] = None
 
 COL_USERS = "users"
 COL_CALLS = "calls"
@@ -648,14 +653,83 @@ def member_status_is_joined(member) -> bool:
     return False
 
 
-async def channel_membership_status(bot, user_id: int) -> Optional[bool]:
-    settings = get_settings()
-    channel = clean_text(settings.get("required_channel") or REQUIRED_CHANNEL_USERNAME, 100)
-    try:
-        member = await bot.get_chat_member(chat_id=channel, user_id=int(user_id))
-        return member_status_is_joined(member)
-    except Exception:
+async def refresh_channel_membership(bot, user_id: int) -> Optional[bool]:
+    """Force a Telegram membership lookup and persist the result for the Dhaka day."""
+    uid = _safe_int(user_id)
+    if uid is None or uid == 0:
         return None
+    try:
+        settings = await asyncio.to_thread(get_settings)
+        channel = clean_text(settings.get("required_channel") or REQUIRED_CHANNEL_USERNAME, 100)
+        member = await bot.get_chat_member(chat_id=channel, user_id=uid)
+        joined = member_status_is_joined(member)
+        ref = db.collection(COL_CHANNEL_MEMBERS).document(str(uid))
+        old = await asyncio.to_thread(lambda: ref.get().to_dict() or {})
+        await asyncio.to_thread(ref.set, {
+            "user_id": uid,
+            "ever_member": bool(old.get("ever_member", False) or joined),
+            "is_member": joined,
+            "checked_day": local_day_key(),
+            "last_checked_at": now(),
+            "last_status": clean_text(getattr(member, "status", "unknown"), 50),
+            "last_error": None,
+        }, merge=True)
+        return joined
+    except Exception as exc:
+        try:
+            ref = db.collection(COL_CHANNEL_MEMBERS).document(str(uid))
+            await asyncio.to_thread(ref.set, {
+                "user_id": uid,
+                "last_check_attempt_at": now(),
+                "last_error": clean_text(exc, 300),
+            }, merge=True)
+        except Exception:
+            pass
+        return None
+
+
+async def channel_membership_status(bot, user_id: int, force: bool = False) -> Optional[bool]:
+    """Use cached membership for the current local day; refresh on day change/manual check."""
+    uid = _safe_int(user_id)
+    if uid is None or uid == 0:
+        return None
+    history = await asyncio.to_thread(membership_history, uid)
+    today = local_day_key()
+    if not force and history.get("checked_day") == today and isinstance(history.get("is_member"), bool):
+        return bool(history.get("is_member"))
+    last_attempt = parse_datetime(history.get("last_check_attempt_at"))
+    if not force and last_attempt is not None and now() - last_attempt < timedelta(minutes=5):
+        return None
+    return await refresh_channel_membership(bot, uid)
+
+
+async def refresh_all_channel_memberships(bot):
+    """Daily background sweep; runs off the user request path to keep the bot responsive."""
+    try:
+        users = await asyncio.to_thread(lambda: list(db.collection(COL_USERS).stream()))
+    except Exception:
+        return
+    seen = set()
+    for snapshot in users:
+        uid = telegram_id_for_record(snapshot)
+        if uid is None or uid == 0 or uid in seen:
+            continue
+        seen.add(uid)
+        try:
+            await refresh_channel_membership(bot, uid)
+        except Exception:
+            pass
+        await asyncio.sleep(0.12)
+
+
+async def channel_membership_midnight_worker(bot):
+    """Run a membership sweep at midnight Asia/Dhaka every day."""
+    while True:
+        local_now = datetime.now(ZoneInfo("Asia/Dhaka"))
+        next_midnight = (local_now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        wait_seconds = max(5, (next_midnight - local_now).total_seconds())
+        await asyncio.sleep(wait_seconds)
+        await refresh_all_channel_memberships(bot)
 
 
 def membership_keyboard():
@@ -749,8 +823,11 @@ async def track_channel_membership(update: Update, context: ContextTypes.DEFAULT
         "user_id": tg_user.id,
         "ever_member": bool(old.get("ever_member", False) or joined),
         "is_member": joined,
+        "checked_day": local_day_key(),
+        "last_checked_at": now(),
         "last_status": clean_text(getattr(member, "status", "unknown"), 50),
         "last_change_at": now(),
+        "last_error": None,
     }, merge=True)
 
 
@@ -769,7 +846,7 @@ def format_balance(value: Any) -> str:
 
 
 def subscription_tier_for_price(price: Any) -> str:
-    """Tier is based on the verified paid package, not unverified user input."""
+    """Return the plan unlocked by a confirmed, admin-approved package payment."""
     try:
         price_value = float(price)
     except (TypeError, ValueError):
@@ -792,7 +869,59 @@ def subscription_for_profile(user_data: dict) -> str:
     tier = clean_text(user_data.get("subscription_tier", "INACTIVE"), 30).upper() or "INACTIVE"
     if balance <= 0 or bool(user_data.get("subscription_exhausted", False)):
         return "INACTIVE"
-    return tier if tier != "INACTIVE" else "INACTIVE"
+    return tier if tier in {"ACTIVE", "PRO", "MAX", "VIP", "ELITE", "LEGEND"} else "INACTIVE"
+
+
+def subscription_badge(tier: str) -> str:
+    badges = {
+        "INACTIVE": "⚪ INACTIVE",
+        "ACTIVE": "🟢 ACTIVE",
+        "PRO": "💎 PRO",
+        "MAX": "🔷 MAX",
+        "VIP": "🟣 VIP",
+        "ELITE": "🟠 ELITE",
+        "LEGEND": "🌟 LEGEND",
+    }
+    return badges.get(str(tier or "INACTIVE").upper(), "⚪ INACTIVE")
+
+
+def profile_message(user_id: int, user_data: dict) -> str:
+    name = clean_text((str(user_data.get("first_name", "")) + " " + str(user_data.get("last_name", ""))).strip(), 100) or "User"
+    balance = credits_float(user_data.get("balance", 0))
+    tier = subscription_for_profile(user_data)
+    tier_lines = {
+        "INACTIVE": "Purchase a credit package to activate your membership.",
+        "ACTIVE": "Your account is active.",
+        "PRO": "PRO membership active — welcome to the premium club.",
+        "MAX": "MAX membership active — enjoy your premium access.",
+        "VIP": "VIP membership active — thanks for supporting the service.",
+        "ELITE": "ELITE membership active — premium account benefits unlocked.",
+        "LEGEND": "LEGEND membership active — highest current plan unlocked.",
+    }
+    return (
+        "👤 𝗠𝗬 𝗣𝗥𝗢𝗙𝗜𝗟𝗘\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👑 Member: {name}\n"
+        f"🪪 Telegram ID: {user_id}\n"
+        f"🔗 Username: @{clean_text(user_data.get('username') or 'none', 100)}\n"
+        f"💳 Credit Balance: {balance:.2f}\n\n"
+        f"🏅 Subscription: {subscription_badge(tier)}\n"
+        f"{tier_lines.get(tier, tier_lines['INACTIVE'])}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📞 Total Calls: {_safe_int(user_data.get('total_calls', 0)) or 0}\n"
+        f"✅ Successful Calls: {_safe_int(user_data.get('successful_calls', 0)) or 0}\n"
+        f"❌ Failed Calls: {_safe_int(user_data.get('failed_calls', 0)) or 0}\n"
+        f"👥 Referrals: {_safe_int(user_data.get('referrals', 0)) or 0}\n"
+        f"💠 Lifetime Purchase Tier: {clean_text(user_data.get('subscription_paid_tier', 'NONE'), 30).upper()}\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def referral_keyboard(referral_link: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Copy Referral Link", copy_text=CopyTextButton(text=referral_link), style="success")],
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu:home", style="primary")],
+    ])
 
 
 def main_keyboard(user_id: int):
@@ -800,8 +929,8 @@ def main_keyboard(user_id: int):
         [KeyboardButton("📞 Send Call", style="success"), KeyboardButton("👤 My Profile", style="primary")],
         [KeyboardButton("👥 Refer", style="primary"), KeyboardButton("📊 LP Statistics", style="primary")],
         [KeyboardButton("💰 Buy Credits", style="success"), KeyboardButton("🎁 Redeem", style="danger")],
-        [KeyboardButton("🕘 Call History", style="primary")],
-        [KeyboardButton("☎️ Support", style="danger")],
+        [KeyboardButton("🕘 Call History", style="primary"), KeyboardButton("☎️ Support", style="danger")],
+        [KeyboardButton("⬅️ Back to Menu", style="primary")],
     ]
     settings = get_settings()
     if settings.get("daily_bonus_enabled", False):
@@ -812,11 +941,11 @@ def main_keyboard(user_id: int):
         rows,
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Select a menu option",
+        input_field_placeholder="Choose an option",
     )
 
 def back_button():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu:home", style="primary")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu:home", style="primary")]])
 
 
 async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -908,7 +1037,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if data == "membership:check":
-        status = await channel_membership_status(context.bot, user_id)
+        status = await channel_membership_status(context.bot, user_id, force=True)
         if status is True:
             if not get_user(user_id):
                 ensure_user(query.from_user)
@@ -935,7 +1064,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_or_send(query, "⛔ Your account is blocked. Support-er sathe contact koro.", None)
         return
 
-    if data == "menu:home":
+    if data in {"menu:home", "menu:back"}:
         context.user_data.clear()
         u = get_user(user_id)
         await edit_or_send(query, f"🏠 *Dashboard*\n\nBalance: *{format_balance(u.get('balance', 0))} credits*\nMenu theke option select koro.", main_keyboard(user_id))
@@ -943,17 +1072,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu:profile":
         u = get_user(user_id)
-        sub_tier = subscription_for_profile(u)
-        text = ("👤 *My Profile*\n\n" f"ID: `{user_id}`\n" f"Name: {escape_markdown(clean_text((u.get('first_name','') + ' ' + u.get('last_name','')).strip() or 'User',100), version=1)}\n" f"Username: @{escape_markdown(u.get('username') or 'none', version=1)}\n" f"Balance: *{format_balance(u.get('balance', 0))} credits*\n" f"Subscription: *{sub_tier}*\n" f"Total Calls: *{_safe_int(u.get('total_calls', 0)) or 0}*\n" f"Successful: *{_safe_int(u.get('successful_calls', 0)) or 0}*\n" f"Failed: *{_safe_int(u.get('failed_calls', 0)) or 0}*\n" f"Total Seconds: *{_safe_int(u.get('total_seconds', 0)) or 0}*\n" f"Referrals: *{_safe_int(u.get('referrals', 0)) or 0}*")
-        await edit_or_send(query, text, back_button())
+        text = profile_message(user_id, u)
+        await edit_or_send(query, text, back_button(), parse_mode=None)
         return
 
     if data == "menu:refer":
         me = await context.bot.get_me()
         referral_link = f"https://t.me/{me.username}?start=ref_{user_id}"
         bonus = credits_float(get_settings().get("referral_bonus", 1))
-        text = ("👥 *Refer Friends*\n\n" f"Referral Bonus: *{bonus:g} Credit(s)*\n" f"Link share koro ar *{bonus:g} credit jite nao!*\n\n" f"Your Link:\n`{referral_link}`\n\n" "Bonus pabe shudhu notun user, jara age required channel member chilo na, bot start kore channel join complete korbe. Existing/previously tracked member referral count hobe na.")
-        await edit_or_send(query, text, back_button())
+        text = ("👥 *Refer Friends*\n\n" f"Referral Bonus: *{bonus:g} Credit(s)*\n" f"Link share koro ar *{bonus:g} credit jite nao!*\n\n" f"Your Link:\n`{escape_markdown(referral_link, version=1)}`\n\n" "Bonus pabe shudhu eligible new user-er jonno. Je user age required channel member chilo, tar referral count hobe na.")
+        await edit_or_send(query, text, referral_keyboard(referral_link))
         return
 
     if data == "menu:stats":
@@ -1176,18 +1304,7 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
 
     if label == "👤 My Profile":
         data = get_user(user_id)
-        name = (str(data.get("first_name", "")) + " " + str(data.get("last_name", ""))).strip() or "User"
-        text = (
-            "👤 MY PROFILE\n━━━━━━━━━━━━━━━━━\n"
-            f"Name: {name}\nTelegram ID: {user_id}\nUsername: @{data.get('username') or 'none'}\n"
-            f"Balance: {format_balance(data.get('balance', 0))} credits\n"
-            f"Subscription: {subscription_for_profile(data)}\n"
-            f"Total Calls: {_safe_int(data.get('total_calls', 0)) or 0}\n"
-            f"Successful Calls: {_safe_int(data.get('successful_calls', 0)) or 0}\n"
-            f"Failed Calls: {_safe_int(data.get('failed_calls', 0)) or 0}\n"
-            f"Referrals: {_safe_int(data.get('referrals', 0)) or 0}"
-        )
-        await message.reply_text(text, reply_markup=keyboard)
+        await message.reply_text(profile_message(user_id, data), reply_markup=keyboard, parse_mode=None)
         return
 
     if label == "👥 Refer":
@@ -1199,8 +1316,8 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
             f"Referral Bonus: {bonus:g} Credit(s)\n"
             f"Link share koro ar {bonus:g} credit jite nao!\n\n"
             f"Your referral link:\n{referral_link}\n\n"
-            "Bonus pabe only eligible new users-er jonno. Jara age theke/age required channel member chilo, tader referral count hobe na.",
-            reply_markup=keyboard,
+            "Bonus pabe only eligible new users-er jonno. Je user age required channel member chilo, tar referral count hobe na.",
+            reply_markup=referral_keyboard(referral_link),
         )
         return
 
@@ -1276,6 +1393,16 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
         await message.reply_text("🛠 Admin Panel — choose an operation:", reply_markup=admin_keyboard_markup())
         return
 
+    if label == "⬅️ Back to Menu":
+        context.user_data.clear()
+        data = get_user(user_id)
+        await message.reply_text(
+            f"🏠 CUSTOM CALL DASHBOARD\n━━━━━━━━━━━━━━━━━━\nBalance: {format_balance(data.get('balance', 0))} credits\nTotal Calls: {_safe_int(data.get('total_calls', 0)) or 0}\nReferrals: {_safe_int(data.get('referrals', 0)) or 0}\n\nMenu theke option select koro.",
+            reply_markup=main_keyboard(user_id),
+            parse_mode=None,
+        )
+        return
+
     await message.reply_text("Dashboard theke ekta option select koro.", reply_markup=keyboard)
 
 
@@ -1296,7 +1423,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     dashboard_labels = {
         "📞 Send Call", "👤 My Profile", "👥 Refer", "📊 LP Statistics",
         "💰 Buy Credits", "🎁 Redeem", "🕘 Call History", "☎️ Support",
-        "🎁 Daily Bonus", "🛠 Admin Panel",
+        "⬅️ Back to Menu", "🎁 Daily Bonus", "🛠 Admin Panel",
     }
     if text in dashboard_labels:
         context.user_data.clear()
@@ -1538,12 +1665,12 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         result = await provider_call(phone, txt=txt, audio=audio, seconds=seconds)
         status_value = str(result.get("status", "")).strip().lower()
-        success = status_value in {"success", "succeeded", "accepted", "ok", "completed"}
-        uncertain = status_value == "accepted_unconfirmed"
+        success = status_value in {"success", "succeeded", "completed"}
+        uncertain = status_value in {"accepted_unconfirmed", "accepted", "ok", "pending", "processing", "queued", "unknown"}
         provider_data = result.get("data") if isinstance(result.get("data"), dict) else {}
         provider_id = provider_data.get("id") or provider_data.get("call_id") or result.get("call_id") or result.get("id")
         recording_url = provider_data.get("recording_url") or provider_data.get("recording") or provider_data.get("audio_url") or result.get("recording_url") or result.get("recording")
-        stored_status = "submitted" if success else "submitted_unconfirmed" if uncertain else "failed"
+        stored_status = "success" if success else "submitted_unconfirmed" if uncertain else "failed"
         safe_result = {
             "status": stored_status,
             "message": clean_provider_message(result.get("message") or ("Provider accepted request" if success else "Provider confirmation unavailable" if uncertain else "Provider rejected request")),
@@ -1564,37 +1691,77 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
             "total_seconds": firestore.Increment(seconds if success else 0),
             "updated_at": now(),
         }, merge=True)
-        if success or uncertain:
+        if success:
             msg = (
-                "✅ *Call Request Sent*\n\n"
-                f"📞 Number: `****{phone[-4:]}`\n⏱ Duration: `{seconds}s`\n"
-                f"💳 Cost: `{cost:g} credits`\n🆔 Call ID: `{clean_text(provider_id or log_ref.id, 120)}`\n\n"
+                "✅ CALL SUCCESS — Provider confirmed success.\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"📞 Number: ****{phone[-4:]}\n"
+                f"⏱ Duration: {seconds}s\n"
+                f"💳 Charged: {cost:g} credits\n"
+                f"🆔 Call ID: {clean_text(provider_id or log_ref.id, 120)}\n"
+                f"Provider: {clean_provider_message(result.get('message') or 'Success') or 'Success'}"
             )
-            if uncertain:
-                msg += "Provider response valid JSON chilo na, tai exact status confirm kora jayni. Call request submit hoyeche bole record kora holo; raw server HTML hide kora hoyeche. Call na gele ei Call ID diye support-e contact koro."
-            else:
-                msg += f"Provider: {escape_markdown(clean_provider_message(result.get('message') or 'Accepted') or 'Accepted', version=1)}"
             if recording_url and re.match(r"^https?://", str(recording_url), re.I):
                 msg += "\n🎧 Recording available."
-                markup = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Listen Recording", url=str(recording_url))]])
-                await update.callback_query.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Listen Recording", url=str(recording_url), style="success")]])
+                await update.callback_query.message.reply_text(msg, parse_mode=None, reply_markup=markup)
             else:
-                await update.callback_query.message.reply_text(msg, parse_mode="Markdown")
+                await update.callback_query.message.reply_text(msg, parse_mode=None)
+        elif uncertain:
+            msg = (
+                "⏳ CALL STATUS UNCONFIRMED\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"Number: ****{phone[-4:]}\nCall ID: {clean_text(provider_id or log_ref.id, 120)}\n"
+                "Provider-er theke final success status paoa jayni, tai call success bola hocche na. Duplicate call avoid korte kichu khon wait koro. Credits temporarily reserved ache; provider confirmation pele history update hobe."
+            )
+            await update.callback_query.message.reply_text(msg, parse_mode=None)
         else:
             refund_credits(user_id, cost, "call_refund", log_ref.id)
             await update.callback_query.message.reply_text(
-                f"❌ Call request rejected by provider.\n{escape_markdown(clean_provider_message(result.get('message') or 'Please try later or contact support.') or 'Please try later.', version=1)}\nCredits refund kora hoyeche."
+                "❌ CALL FAILED\n"
+                f"Reason: {clean_provider_message(result.get('message') or 'Provider rejected the request.') or 'Provider rejected the request.'}\n"
+                f"{cost:g} credits refund kora hoyeche.",
+                parse_mode=None,
             )
-    except Exception as exc:
-        log_ref.update({"status": "submitted_unconfirmed", "error": clean_text(exc, 500), "updated_at": now()})
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        # These errors occur before an HTTP connection is established, so the provider
+        # cannot have confirmed the request. Restore the reserved credits idempotently.
+        log_ref.update({"status": "failed", "error": clean_text(exc, 500), "updated_at": now()})
         user_ref(user_id).set({
             "total_calls": firestore.Increment(1),
+            "failed_calls": firestore.Increment(1),
             "updated_at": now(),
         }, merge=True)
+        try:
+            refund_credits(user_id, cost, "call_refund_connect_error", log_ref.id)
+        except Exception:
+            pass
         await update.callback_query.message.reply_text(
-            f"✅ Call request pathano hoyeche, kintu provider confirmation paoa jayni. Raw error hide kora holo. Call ID: `{escape_markdown(log_ref.id, version=1)}`. Call na gele support-e contact koro.",
-            parse_mode="Markdown",
+            f"❌ Provider-er sathe connection hoyni. {cost:g} credits refund kora hoyeche. Kichu khon por abar try koro.",
+            parse_mode=None,
         )
+    except Exception as exc:
+        # Once a request may have left this server, a generic timeout/error is ambiguous.
+        # Preserve a final status if it was already stored; never double-count the call.
+        current_record = {}
+        try:
+            current_record = log_ref.get().to_dict() or {}
+        except Exception:
+            pass
+        current_status = str(current_record.get("status", "")).lower()
+        if current_status not in {"success", "failed", "submitted_unconfirmed"}:
+            log_ref.update({"status": "submitted_unconfirmed", "error": clean_text(exc, 500), "updated_at": now()})
+            user_ref(user_id).set({
+                "total_calls": firestore.Increment(1),
+                "updated_at": now(),
+            }, merge=True)
+        try:
+            await update.callback_query.message.reply_text(
+                f"⏳ Call status unconfirmed or notification failed. Success bola hocche na unless provider explicitly confirms it. Call ID: {log_ref.id}. Call History check koro; duplicate call avoid korte retry korar age wait koro.",
+                parse_mode=None,
+            )
+        except Exception:
+            pass
     finally:
         context.user_data.clear()
 
@@ -1637,17 +1804,24 @@ async def provider_call(number: str, txt: Optional[str] = None, audio: Optional[
         if data is None:
             return {"status": "error", "message": "Provider returned an unreadable response. Raw output hidden.", "http_code": response.status_code, "response_type": "unknown"}
         provider_status = str(data.get("status", "")).strip().lower()
-        if response.status_code >= 500 and provider_status not in {"success", "accepted", "ok", "completed"}:
+        success_statuses = {"success", "succeeded", "completed"}
+        failure_statuses = {"error", "failed", "failure", "rejected", "denied", "cancelled", "canceled"}
+        if response.status_code < 400 and provider_status in success_statuses:
+            data["status"] = "success"
+            data["message"] = clean_provider_message(data.get("message") or "Success")
+            data["http_code"] = response.status_code
+            return data
+        if provider_status in failure_statuses:
+            return {"status": "error", "message": clean_provider_message(data.get("message") or "Provider rejected the request."), "http_code": response.status_code, "response_type": "json"}
+        if response.status_code >= 500:
             msg = clean_provider_message(data.get("message"))
-            # HTTP 5xx can happen after the provider starts the call; don't falsely claim hard failure.
-            return {"status": "accepted_unconfirmed", "message": msg or "Provider server error after request; status unconfirmed.", "http_code": response.status_code, "response_type": "json", "data": data.get("data")}
-        if response.status_code >= 400 and provider_status not in {"success", "accepted", "ok", "completed"}:
+            return {"status": "accepted_unconfirmed", "message": msg or "Provider server response was uncertain; final status is not available.", "http_code": response.status_code, "response_type": "json", "data": data.get("data")}
+        if response.status_code >= 400:
             return {"status": "error", "message": clean_provider_message(data.get("message") or f"Provider HTTP {response.status_code}"), "http_code": response.status_code}
-        if not provider_status and response.status_code < 400:
-            # Don't treat an empty/malformed status as a confirmed success.
-            data["status"] = "accepted_unconfirmed"
-            data["message"] = clean_provider_message(data.get("message") or "Provider accepted HTTP request but did not return a status.")
-        data["message"] = clean_provider_message(data.get("message") or "")
+        # HTTP 2xx with accepted/ok/pending/unknown status is not a confirmed call success.
+        data["status"] = "accepted_unconfirmed"
+        data["message"] = clean_provider_message(data.get("message") or "Provider did not return an explicit success status.")
+        data["http_code"] = response.status_code
         return data
 
 async def account_api(endpoint: str) -> dict:
@@ -1873,7 +2047,7 @@ async def local_stats() -> dict:
         valid_users.append({"user_id": uid, "name": name, "balance": credits_float(user.get("balance", 0))})
     credits = sum(item["balance"] for item in valid_users)
     statuses = [str((snap.to_dict() or {}).get("status", "")).lower() for snap in calls]
-    success = sum(1 for status in statuses if status in {"submitted", "completed", "success"})
+    success = sum(1 for status in statuses if status in {"success", "succeeded", "completed"})
     failed = sum(1 for status in statuses if status == "failed")
     return {
         "users": len(valid_users), "calls": len(calls), "success": success, "failed": failed,
@@ -1948,23 +2122,40 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = "admin_createcode"
         await edit_or_send(
             query,
-            "🎁 Send: `CREDITS MAX_USES DAYS`\nExample: `25 100 30`\nUse MAX_USES=0 for unlimited.",
+            "🎁 Custom Redeem Code\n\nSend: `CODE CREDITS MAX_USES DAYS`\nExample: `EMON50 50 100 30`\nCODE: letters, numbers, _ or - (3–32 chars).\nMAX_USES=0 means unlimited; DAYS=0 means never expires.",
             back_button(),
         )
     elif action == "codes":
-        docs = list(db.collection(COL_CODES).order_by("created_at", direction=firestore.Query.DESCENDING).limit(15).stream())
+        docs = list(db.collection(COL_CODES).order_by("created_at", direction=firestore.Query.DESCENDING).limit(10).stream())
         if not docs:
             await edit_or_send(query, "📜 No redeem codes yet.", back_button())
             return
-        lines = ["📜 *Recent Redeem Codes*\n"]
+        lines = ["📜 *Redeem Codes*\nTap a delete button to remove a code.\n"]
+        rows = []
         for s in docs:
             c = s.to_dict() or {}
+            code = clean_text(c.get("code", "unknown"), 40)
+            uses = _safe_int(c.get("uses", 0)) or 0
+            max_uses = _safe_int(c.get("max_uses", 0)) or 0
             lines.append(
-                f"`{c.get('code')}` — {credits_float(c.get('credits', 0)):g} — "
-                f"{_safe_int(c.get('uses', 0)) or 0}/{(_safe_int(c.get('max_uses', 0)) or 0) if (_safe_int(c.get('max_uses', 0)) or 0) else '∞'} — "
-                f"{'ON' if c.get('active', True) else 'OFF'}"
+                f"`{escape_markdown(code, version=1)}` — {credits_float(c.get('credits', 0)):g} credits — "
+                f"{uses}/{max_uses if max_uses else '∞'} — {'ON' if c.get('active', True) else 'OFF'}"
             )
-        await edit_or_send(query, "\n".join(lines), back_button())
+            rows.append([InlineKeyboardButton(f"🗑 Delete {code[:24]}", callback_data=f"admin:deletecode:{s.id}", style="danger")])
+        rows.append([InlineKeyboardButton("⬅️ Back to Admin", callback_data="admin:menu", style="primary")])
+        await edit_or_send(query, "\n".join(lines), InlineKeyboardMarkup(rows))
+    elif action.startswith("deletecode:"):
+        record_id = action.split(":", 1)[1]
+        code_ref = db.collection(COL_CODES).document(record_id)
+        code_snap = code_ref.get()
+        if not code_snap.exists:
+            await edit_or_send(query, "ℹ️ Ei redeem code already deleted or missing.", admin_keyboard_markup(), parse_mode=None)
+            return
+        code_data = code_snap.to_dict() or {}
+        code_name = clean_text(code_data.get("code", record_id), 40)
+        code_ref.delete()
+        audit("redeem_code_deleted", query.from_user.id, {"code": code_name, "record_id": record_id})
+        await edit_or_send(query, f"✅ Redeem code deleted: {code_name}", admin_keyboard_markup(), parse_mode=None)
     elif action == "payments":
         docs = list(
             db.collection(COL_PAYMENTS)
@@ -2273,19 +2464,33 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if state == "admin_createcode":
         parts = text.split()
-        if len(parts) != 3:
+        if len(parts) not in {3, 4}:
             await update.effective_message.reply_text(
-                "Format: CREDITS MAX_USES DAYS\nExample: 25 100 30\nMAX_USES=0 means unlimited."
+                "Format: CODE CREDITS MAX_USES DAYS\nExample: EMON50 50 100 30\nFor random code, send: CREDITS MAX_USES DAYS.\nMAX_USES=0 unlimited; DAYS=0 never expires."
             )
             return
         try:
-            amount = credits_float(parts[0])
-            max_uses = int(parts[1])
-            days = int(parts[2])
+            if len(parts) == 4:
+                code = parts[0].strip().upper()
+                amount = credits_float(parts[1])
+                max_uses = int(parts[2])
+                days = int(parts[3])
+                if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
+                    raise ValueError("Custom code must be 3–32 characters: A-Z, 0-9, _ or -.")
+            else:
+                amount = credits_float(parts[0])
+                max_uses = int(parts[1])
+                days = int(parts[2])
+                alphabet = string.ascii_uppercase + string.digits
+                code = "CALL-" + "".join(secrets.choice(alphabet) for _ in range(10))
             if amount <= 0 or max_uses < 0 or days < 0:
                 raise ValueError("Credits must be positive; MAX_USES and DAYS must be zero or greater.")
-            alphabet = string.ascii_uppercase + string.digits
-            code = "CALL-" + "".join(secrets.choice(alphabet) for _ in range(10))
+            existing_code = any(
+                str((item.to_dict() or {}).get("code", "")).strip().upper() == code
+                for item in db.collection(COL_CODES).stream()
+            )
+            if existing_code:
+                raise ValueError("This redeem code already exists. Choose another custom code.")
             expires = now() + timedelta(days=days) if days else None
             code_ref = db.collection(COL_CODES).document()
             code_ref.set({
@@ -2302,7 +2507,7 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"Code: {code}\nCredits: {amount:g}\n"
                 f"Max uses: {'Unlimited' if max_uses == 0 else max_uses}\n"
                 f"Expires: {'Never' if not days else iso(expires)}\n"
-                f"Code record: {code_ref.id}",
+                f"Code record: {code_ref.id}\n\nAdmin Panel → Redeem Codes theke delete korte parbe.",
                 reply_markup=main_keyboard(admin_id),
             )
             context.user_data.clear()
@@ -2523,6 +2728,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "",
             "Credit add format: numeric Telegram user ID / private chat ID + amount. User must start bot first.",
             "Purchase protection: 3 transaction submission attempts per 10 minutes; invalid and duplicate Transaction IDs count toward the limit.",
+            "Redeem code create: Admin Panel → Create Redeem → CODE CREDITS MAX_USES DAYS, e.g. EMON50 50 100 30. Delete: Redeem Codes → tap Delete.",
+            "Channel membership cached for the day and rechecked automatically near midnight Asia/Dhaka; manual Join/Check refreshes immediately.",
             "Block/Unblock user Admin Panel-er buttons thekeo kora jay.",
         ]
     await update.effective_message.reply_text("\n".join(lines), reply_markup=main_keyboard(uid) if uid else None)
@@ -2779,13 +2986,26 @@ async def provider_call_webhook(request: Request):
     call_ref = matches[0].reference
     call_data = matches[0].to_dict() or {}
     updates = {"updated_at": now()}
-    if status:
-        updates["status"] = clean_text(status, 100)
+    raw_status = str(status or "").strip().lower()
+    success_statuses = {"success", "succeeded", "completed"}
+    failure_statuses = {"failed", "failure", "error", "rejected", "denied", "cancelled", "canceled"}
+    new_status = None
+    old_status = str(call_data.get("status", "")).strip().lower()
+    if raw_status in success_statuses:
+        new_status = "success"
+        updates["status"] = new_status
+    elif raw_status in failure_statuses:
+        new_status = "failed"
+        updates["status"] = new_status
+    elif status:
+        updates["provider_status"] = clean_text(status, 100)
     if recording_url:
         updates["recording_url"] = clean_text(recording_url, 2000)
+    actual_duration = None
     if duration is not None:
         try:
-            updates["actual_duration"] = int(duration)
+            actual_duration = max(0, int(duration))
+            updates["actual_duration"] = actual_duration
         except Exception:
             pass
     call_ref.update(updates)
@@ -2793,15 +3013,36 @@ async def provider_call_webhook(request: Request):
     uid = _safe_int(call_data.get("user_id"))
     if uid is None or uid == 0:
         return {"ok": True, "updated": False, "reason": "Call record has no valid user ID"}
+
+    # Apply provider final results to user stats once; only explicit provider success counts as success.
+    user_document = user_ref(uid)
+    if new_status == "success" and old_status not in success_statuses:
+        increment_seconds = actual_duration if actual_duration is not None else (_safe_int(call_data.get("time", 0)) or 0)
+        user_document.update({
+            "successful_calls": firestore.Increment(1),
+            "total_seconds": firestore.Increment(increment_seconds),
+            "updated_at": now(),
+        })
+    elif new_status == "failed" and old_status not in failure_statuses:
+        user_document.update({"failed_calls": firestore.Increment(1), "updated_at": now()})
+        try:
+            charge = credits_float(call_data.get("cost", 0))
+            if charge > 0:
+                refund_credits(uid, charge, "call_refund_webhook", matches[0].id)
+        except Exception:
+            pass
     if recording_url:
         try:
+            recording_markup = None
+            if re.match(r"^https?://", str(recording_url), re.I):
+                recording_markup = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("▶️ Listen Recording", url=str(recording_url), style="success")]]
+                )
             await telegram_app.bot.send_message(
                 uid,
-                f"🎧 *Call recording is ready.*\nCall ID: `{provider_call_id}`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("▶️ Listen Recording", url=str(recording_url))]]
-                ),
+                f"🎧 Call recording is ready.\nCall ID: {clean_text(provider_call_id, 120)}",
+                parse_mode=None,
+                reply_markup=recording_markup,
             )
         except Exception:
             pass
@@ -2811,7 +3052,7 @@ async def provider_call_webhook(request: Request):
 
 @app.on_event("startup")
 async def startup():
-    global telegram_app
+    global telegram_app, channel_recheck_task
     ensure_settings()
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start_command))
@@ -2832,6 +3073,7 @@ async def startup():
 
     await telegram_app.initialize()
     await telegram_app.start()
+    channel_recheck_task = asyncio.create_task(channel_membership_midnight_worker(telegram_app.bot))
     try:
         await telegram_app.bot.set_my_commands([
             BotCommand("start", "Start"),
@@ -2854,7 +3096,16 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global telegram_app
+    global telegram_app, channel_recheck_task
+    if channel_recheck_task:
+        channel_recheck_task.cancel()
+        try:
+            await channel_recheck_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        channel_recheck_task = None
     if telegram_app:
         try:
             await telegram_app.stop()
