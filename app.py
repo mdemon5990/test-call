@@ -722,13 +722,15 @@ async def refresh_all_channel_memberships(bot):
 
 
 async def channel_membership_midnight_worker(bot):
-    """Run a membership sweep at midnight Asia/Dhaka every day."""
+    """Refresh known channel memberships every 12 hours without blocking updates."""
     while True:
-        local_now = datetime.now(ZoneInfo("Asia/Dhaka"))
-        next_midnight = (local_now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
-        wait_seconds = max(5, (next_midnight - local_now).total_seconds())
-        await asyncio.sleep(wait_seconds)
-        await refresh_all_channel_memberships(bot)
+        await asyncio.sleep(12 * 60 * 60)
+        try:
+            await refresh_all_channel_memberships(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Scheduled channel membership refresh failed")
 
 
 def membership_keyboard():
@@ -959,6 +961,7 @@ async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
             referrer_id = int(match.group(1))
 
     existing = get_user(tg_user.id)
+    is_new_user = not bool(existing)
     status = await channel_membership_status(context.bot, tg_user.id)
     if status is None:
         await show_join_gate(message, context, verification_error=True)
@@ -994,6 +997,13 @@ async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "\n\n🛠 Service maintenance-e ache."
     if notice:
         text += f"\n\nℹ️ {escape_markdown(clean_text(notice, 500), version=1)}"
+    if is_new_user:
+        welcome = (
+            f"🎉 স্বাগতম, {clean_text(tg_user.first_name or 'বন্ধু', 80)}!\n\n"
+            "Custom Call Bot-এ আপনাকে স্বাগতম। আপনার অ্যাকাউন্ট তৈরি হয়েছে এবং স্বাগতম বোনাসের নিয়ম অনুযায়ী ক্রেডিট যোগ করা হয়েছে।\n\n"
+            "নিচের মেনু থেকে একটি অপশন বেছে নিন।"
+        )
+        text = welcome + "\n\n" + text
     await message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard(tg_user.id))
 
 def strip_markdown_for_fallback(text: str) -> str:
@@ -1470,7 +1480,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if state == "admin_broadcast":
         await do_broadcast(update, context, text)
         return
-    await update.effective_message.reply_text("Choose an option from the dashboard keyboard.", reply_markup=main_keyboard(user_id))
+    # Ignore unrelated text when the user has not selected an action.
+    return
 
 async def ask_call_time(update: Update):
     markup = InlineKeyboardMarkup([
@@ -3225,10 +3236,6 @@ async def startup():
     try:
         await telegram_app.bot.set_my_commands([
             BotCommand("start", "Start"),
-            BotCommand("admin", "Admin"),
-            BotCommand("help", "Help"),
-            BotCommand("call", "Send Call"),
-            BotCommand("cancel", "Cancel current action"),
         ])
     except Exception:
         pass
