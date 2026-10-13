@@ -7,7 +7,6 @@ import hashlib
 import uuid
 import secrets
 import string
-import tempfile
 import asyncio
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -19,9 +18,9 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import firebase_admin
-from firebase_admin import credentials, db as firebase_db, storage
+from firebase_admin import credentials, db as firebase_db
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from telegram import BotCommand, CopyTextButton, Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from telegram.helpers import escape_markdown
@@ -42,13 +41,14 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 CALL_API_TOKEN = os.getenv("CALL_API_TOKEN", "").strip()
 CALL_API_BASE = os.getenv("CALL_API_BASE", "https://sms.bd1b.com/api/v1").rstrip("/")
+if CALL_API_BASE.lower().endswith("/call"):
+    CALL_API_BASE = CALL_API_BASE[:-5].rstrip("/")
 CALL_WEBHOOK_SECRET = os.getenv("CALL_WEBHOOK_SECRET", "").strip()
 PAYMENT_REVIEW_CHAT_ID = os.getenv("PAYMENT_REVIEW_CHAT_ID", "@ffxemon").strip()
 SUPPORT_CONTACT_URL = os.getenv("SUPPORT_CONTACT_URL", f"tg://user?id={os.getenv('ADMIN_ID', '7034779471').strip()}").strip()
 REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "@CyberShunya_x").strip() or "@CyberShunya_x"
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").strip()
 FIREBASE_CREDENTIALS_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON", "").strip()
-FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
 
 if not BOT_TOKEN:
@@ -68,8 +68,6 @@ except json.JSONDecodeError as exc:
 if not firebase_admin._apps:
     cred = credentials.Certificate(service_account_info)
     firebase_options = {"databaseURL": FIREBASE_DATABASE_URL}
-    if FIREBASE_STORAGE_BUCKET:
-        firebase_options["storageBucket"] = FIREBASE_STORAGE_BUCKET
     firebase_admin.initialize_app(cred, firebase_options)
 
 
@@ -266,11 +264,11 @@ firestore = SimpleNamespace(
 )
 db = _DatabaseCompat()
 bucket = None
-if FIREBASE_STORAGE_BUCKET:
-    try:
-        bucket = storage.bucket(FIREBASE_STORAGE_BUCKET)
-    except Exception:
-        bucket = None
+
+provider_http_client: Optional[httpx.AsyncClient] = None
+provider_call_semaphore: Optional[asyncio.Semaphore] = None
+audio_proxy_semaphore: Optional[asyncio.Semaphore] = None
+USER_CALL_LOCKS: dict[int, asyncio.Lock] = {}
 
 app = FastAPI(title="Custom Call Bot", version="1.0.0")
 
@@ -284,6 +282,7 @@ COL_CODES = "redeem_codes"
 COL_PAYMENTS = "payments"
 COL_AUDIT = "audit_logs"
 COL_SETTINGS = "settings"
+COL_PROVIDER_AUDIO = "provider_audio_tokens"
 
 UTC = timezone.utc
 
@@ -920,7 +919,6 @@ def profile_message(user_id: int, user_data: dict) -> str:
 def referral_keyboard(referral_link: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 Copy Referral Link", copy_text=CopyTextButton(text=referral_link), style="success")],
-        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu:home", style="primary")],
     ])
 
 
@@ -930,7 +928,6 @@ def main_keyboard(user_id: int):
         [KeyboardButton("👥 Refer", style="primary"), KeyboardButton("📊 LP Statistics", style="primary")],
         [KeyboardButton("💰 Buy Credits", style="success"), KeyboardButton("🎁 Redeem", style="danger")],
         [KeyboardButton("🕘 Call History", style="primary"), KeyboardButton("☎️ Support", style="danger")],
-        [KeyboardButton("⬅️ Back to Menu", style="primary")],
     ]
     settings = get_settings()
     if settings.get("daily_bonus_enabled", False):
@@ -945,7 +942,8 @@ def main_keyboard(user_id: int):
     )
 
 def back_button():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu:home", style="primary")]])
+    # Keep navigation in the standard Telegram chat keyboard; do not add a fake exit/back button.
+    return None
 
 
 async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1130,7 +1128,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         support_text = clean_text(get_settings().get("support_text", "Support er jonno admin-ke message koro."), 1800)
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("✉️ Message Support Admin", url=support_url, style="primary")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="menu:home", style="primary")],
         ])
         await edit_or_send(query, f"☎️ *Support*\n\n{support_text}\n\nAdmin ID: `{ADMIN_ID}`", markup)
         return
@@ -1393,16 +1390,6 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
         await message.reply_text("🛠 Admin Panel — choose an operation:", reply_markup=admin_keyboard_markup())
         return
 
-    if label == "⬅️ Back to Menu":
-        context.user_data.clear()
-        data = get_user(user_id)
-        await message.reply_text(
-            f"🏠 CUSTOM CALL DASHBOARD\n━━━━━━━━━━━━━━━━━━\nBalance: {format_balance(data.get('balance', 0))} credits\nTotal Calls: {_safe_int(data.get('total_calls', 0)) or 0}\nReferrals: {_safe_int(data.get('referrals', 0)) or 0}\n\nMenu theke option select koro.",
-            reply_markup=main_keyboard(user_id),
-            parse_mode=None,
-        )
-        return
-
     await message.reply_text("Dashboard theke ekta option select koro.", reply_markup=keyboard)
 
 
@@ -1423,7 +1410,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     dashboard_labels = {
         "📞 Send Call", "👤 My Profile", "👥 Refer", "📊 LP Statistics",
         "💰 Buy Credits", "🎁 Redeem", "🕘 Call History", "☎️ Support",
-        "⬅️ Back to Menu", "🎁 Daily Bonus", "🛠 Admin Panel",
+        "🎁 Daily Bonus", "🛠 Admin Panel",
     }
     if text in dashboard_labels:
         context.user_data.clear()
@@ -1483,7 +1470,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if state == "admin_broadcast":
         await do_broadcast(update, context, text)
         return
-    await update.effective_message.reply_text("Dashboard menu use koro.", reply_markup=main_keyboard(user_id))
+    await update.effective_message.reply_text("Choose an option from the dashboard keyboard.", reply_markup=main_keyboard(user_id))
 
 async def ask_call_time(update: Update):
     markup = InlineKeyboardMarkup([
@@ -1505,98 +1492,106 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not update.effective_user or not update.effective_message:
         return
     user_id = update.effective_user.id
-    status = await channel_membership_status(context.bot, user_id)
-    if status is not True:
-        await show_join_gate(update.effective_message, context, verification_error=status is None)
+    channel_status = await channel_membership_status(context.bot, user_id)
+    if channel_status is not True:
+        await show_join_gate(update.effective_message, context, verification_error=channel_status is None)
         return
     ensure_user(update.effective_user)
     if user_blocked(user_id) and not is_admin(user_id):
         await update.effective_message.reply_text("⛔ Your account is blocked.")
         return
-    state = context.user_data.get("state")
-    if state != "call_content_audio_upload":
-        await update.effective_message.reply_text("Use Send Call → Upload Audio first.")
-        return
-    if bucket is None:
-        await update.effective_message.reply_text(
-            "❌ Firebase Storage is not configured. Set FIREBASE_STORAGE_BUCKET first."
-        )
+    if context.user_data.get("state") != "call_content_audio_upload":
+        await update.effective_message.reply_text("First select Send Call → Upload Audio, then send an MP3/WAV/OGG or voice message.")
         return
 
-    tg_file = None
+    message = update.effective_message
+    media = None
     extension = "ogg"
     content_type = "audio/ogg"
-    if update.effective_message.audio:
-        tg_file = await update.effective_message.audio.get_file()
-        name = update.effective_message.audio.file_name or "audio.mp3"
-        m = re.search(r"\.(mp3|wav|ogg)$", name, re.I)
-        extension = m.group(1).lower() if m else "mp3"
-        content_type = {
-            "mp3": "audio/mpeg",
-            "wav": "audio/wav",
-            "ogg": "audio/ogg",
-        }.get(extension, "audio/mpeg")
-    elif update.effective_message.voice:
-        tg_file = await update.effective_message.voice.get_file()
+    if message.audio:
+        media = message.audio
+        name = media.file_name or ""
+        match = re.search(r"\.(mp3|wav|ogg)$", name, re.I)
+        if match:
+            extension = match.group(1).lower()
+        else:
+            mime = (getattr(media, "mime_type", "") or "").lower()
+            extension = "wav" if "wav" in mime else "ogg" if "ogg" in mime else "mp3"
+        content_type = {"mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg"}[extension]
+    elif message.voice:
+        media = message.voice
         extension = "ogg"
         content_type = "audio/ogg"
-    elif update.effective_message.document:
-        name = update.effective_message.document.file_name or ""
-        if not re.search(r"\.(mp3|wav|ogg)$", name, re.I):
-            await update.effective_message.reply_text("❌ Supported upload types: MP3, WAV, OGG.")
+    elif message.document:
+        media = message.document
+        name = media.file_name or ""
+        match = re.search(r"\.(mp3|wav|ogg)$", name, re.I)
+        if not match:
+            await message.reply_text("❌ Supported audio types: MP3, WAV, OGG.")
             return
-        tg_file = await update.effective_message.document.get_file()
-        extension = re.search(r"\.(mp3|wav|ogg)$", name, re.I).group(1).lower()
-        content_type = {
-            "mp3": "audio/mpeg",
-            "wav": "audio/wav",
-            "ogg": "audio/ogg",
-        }[extension]
-
-    if tg_file is None:
-        await update.effective_message.reply_text("❌ No supported audio file detected.")
+        extension = match.group(1).lower()
+        content_type = {"mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg"}[extension]
+    else:
+        await message.reply_text("❌ Supported audio types: MP3, WAV, OGG or Telegram voice message.")
         return
 
-    status = await update.effective_message.reply_text("⏳ Uploading audio securely...")
-    temp_path = None
+    file_size = _safe_int(getattr(media, "file_size", None))
+    max_size = 15 * 1024 * 1024
+    if file_size is not None and file_size > max_size:
+        await message.reply_text("❌ Audio file 15 MB-er beshi. Choto MP3/WAV/OGG file pathao.")
+        return
+    if not PUBLIC_BASE_URL or not re.match(r"^https://", PUBLIC_BASE_URL, re.I):
+        await message.reply_text("❌ Audio proxy-r jonno Render-er HTTPS PUBLIC_BASE_URL set koro (example: https://your-service.onrender.com). Firebase Storage bucket lagbe na.")
+        return
+
+    token = secrets.token_urlsafe(32)
+    expires_at = now() + timedelta(minutes=45)
+    token_ref = db.collection(COL_PROVIDER_AUDIO).document(token)
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}") as tmp:
-            temp_path = tmp.name
-        await tg_file.download_to_drive(temp_path)
-        object_name = f"user_audio/{user_id}/{uuid.uuid4().hex}.{extension}"
-        blob = bucket.blob(object_name)
-        blob.upload_from_filename(temp_path, content_type=content_type)
-        url = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=30),
-            method="GET",
-        )
-        context.user_data["call_audio_url"] = url
-        await status.edit_text("✅ Audio uploaded. Choose the call duration.")
+        token_ref.set({
+            "token": token,
+            "file_id": media.file_id,
+            "user_id": user_id,
+            "extension": extension,
+            "content_type": content_type,
+            "file_size": file_size or 0,
+            "created_at": now(),
+            "expires_at": expires_at,
+            "fetches": 0,
+        })
+        audio_url = f"{PUBLIC_BASE_URL}/provider-audio/{token}/audio.{extension}"
+        context.user_data["call_audio_url"] = audio_url
+        await message.reply_text("✅ Audio ready. Firebase Storage use kora hoyni; secure temporary audio link create hoyeche. Ekhon call duration select koro.")
         await ask_call_time(update)
     except Exception as exc:
-        error_text = clean_text(exc, 1200)
-        lower_error = error_text.lower()
-        if "specified bucket does not exist" in lower_error or "bucket does not exist" in lower_error or '"code": 404' in lower_error or "notfound" in lower_error:
-            friendly = (
-                "❌ Firebase Storage bucket পাওয়া যায়নি। Firebase Console → Build → Storage → Get started থেকে Storage bucket create/enable koro.\n\n"
-                "Tarpor Console-e je exact bucket name dekhabe seta Render-er FIREBASE_STORAGE_BUCKET-e dao. "
-                "Bucket create na korle upload code diye fix kora jabe na. Service-account-er Storage upload permission-o lagbe."
-            )
-            await status.edit_text(friendly)
-        elif "permission" in lower_error or "forbidden" in lower_error or "403" in lower_error:
-            await status.edit_text("❌ Firebase Storage permission denied. Service account-er Storage Object Creator/Storage Admin permission check koro.")
-        else:
-            await status.edit_text(f"❌ Audio upload failed: {error_text[:500]}")
-    finally:
-        if temp_path:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+        try:
+            token_ref.delete()
+        except Exception:
+            pass
+        await message.reply_text(f"❌ Audio prepare kora jayni: {clean_text(exc, 400)}")
 
 
 async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None:
+        return
+    uid = user.id
+    lock = USER_CALL_LOCKS.setdefault(uid, asyncio.Lock())
+    if lock.locked():
+        try:
+            await update.callback_query.message.reply_text("⏳ Ei account-er ekta call request already process hocche. Ektu wait koro.")
+        except Exception:
+            pass
+        return
+    try:
+        async with lock:
+            await _execute_pending_call_impl(update, context)
+    finally:
+        if USER_CALL_LOCKS.get(uid) is lock and not lock.locked():
+            USER_CALL_LOCKS.pop(uid, None)
+
+
+async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     settings = get_settings()
     u = get_user(user_id)
@@ -1661,7 +1656,28 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.clear()
         return
 
-    await update.callback_query.message.reply_text("📡 Call request pathano hocche...")
+    progress_message = None
+    try:
+        progress_message = await update.callback_query.message.reply_text(
+            "📡 SENDING CALL\nProvider API response-er jonno wait kora hocche. Ei message response pele update hobe...",
+            parse_mode=None,
+        )
+    except Exception:
+        # Failure to display progress must not stop a valid provider request.
+        progress_message = None
+
+    async def report_call_result(text: str, reply_markup=None):
+        if progress_message is not None:
+            try:
+                await progress_message.edit_text(text, parse_mode=None, reply_markup=reply_markup)
+                return
+            except Exception:
+                pass
+        try:
+            await update.callback_query.message.reply_text(text, parse_mode=None, reply_markup=reply_markup)
+        except Exception:
+            pass
+
     try:
         result = await provider_call(phone, txt=txt, audio=audio, seconds=seconds)
         status_value = str(result.get("status", "")).strip().lower()
@@ -1704,9 +1720,9 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
             if recording_url and re.match(r"^https?://", str(recording_url), re.I):
                 msg += "\n🎧 Recording available."
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Listen Recording", url=str(recording_url), style="success")]])
-                await update.callback_query.message.reply_text(msg, parse_mode=None, reply_markup=markup)
+                await report_call_result(msg, reply_markup=markup)
             else:
-                await update.callback_query.message.reply_text(msg, parse_mode=None)
+                await report_call_result(msg)
         elif uncertain:
             msg = (
                 "⏳ CALL STATUS UNCONFIRMED\n"
@@ -1714,14 +1730,13 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"Number: ****{phone[-4:]}\nCall ID: {clean_text(provider_id or log_ref.id, 120)}\n"
                 "Provider-er theke final success status paoa jayni, tai call success bola hocche na. Duplicate call avoid korte kichu khon wait koro. Credits temporarily reserved ache; provider confirmation pele history update hobe."
             )
-            await update.callback_query.message.reply_text(msg, parse_mode=None)
+            await report_call_result(msg)
         else:
             refund_credits(user_id, cost, "call_refund", log_ref.id)
-            await update.callback_query.message.reply_text(
+            await report_call_result(
                 "❌ CALL FAILED\n"
                 f"Reason: {clean_provider_message(result.get('message') or 'Provider rejected the request.') or 'Provider rejected the request.'}\n"
-                f"{cost:g} credits refund kora hoyeche.",
-                parse_mode=None,
+                f"{cost:g} credits refund kora hoyeche."
             )
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
         # These errors occur before an HTTP connection is established, so the provider
@@ -1736,9 +1751,8 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
             refund_credits(user_id, cost, "call_refund_connect_error", log_ref.id)
         except Exception:
             pass
-        await update.callback_query.message.reply_text(
-            f"❌ Provider-er sathe connection hoyni. {cost:g} credits refund kora hoyeche. Kichu khon por abar try koro.",
-            parse_mode=None,
+        await report_call_result(
+            f"❌ Provider-er sathe connection hoyni. {cost:g} credits refund kora hoyeche. Kichu khon por abar try koro."
         )
     except Exception as exc:
         # Once a request may have left this server, a generic timeout/error is ambiguous.
@@ -1756,9 +1770,8 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
                 "updated_at": now(),
             }, merge=True)
         try:
-            await update.callback_query.message.reply_text(
-                f"⏳ Call status unconfirmed or notification failed. Success bola hocche na unless provider explicitly confirms it. Call ID: {log_ref.id}. Call History check koro; duplicate call avoid korte retry korar age wait koro.",
-                parse_mode=None,
+            await report_call_result(
+                f"⏳ Call status unconfirmed. Provider explicit success dey ni. Call ID: {log_ref.id}. Call History check koro; duplicate call avoid korte retry korar age wait koro."
             )
         except Exception:
             pass
@@ -1781,48 +1794,103 @@ def clean_provider_message(value: Any) -> str:
 async def provider_call(number: str, txt: Optional[str] = None, audio: Optional[str] = None, seconds: int = 30) -> dict:
     if not txt and not audio:
         raise ValueError("Either text or audio is required")
-    payload = {"api_token": CALL_API_TOKEN, "number": number, "time": int(max(1, min(300, seconds)))}
+    payload = {
+        "api_token": CALL_API_TOKEN,
+        "number": number,
+        "time": int(max(1, min(300, seconds))),
+    }
     if txt:
         payload["txt"] = txt
     else:
         payload["audio"] = audio
-    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-        response = await client.post(f"{CALL_API_BASE}/call", data=payload)
-        body = response.text or ""
-        content_type = (response.headers.get("content-type") or "").lower()
-        try:
-            data = response.json()
-            if not isinstance(data, dict):
-                data = {"status": "error", "message": "Provider returned an unexpected response format."}
-        except Exception:
+
+    # Provider docs allow POST/GET. Use POST form data to avoid placing the API token in URL logs.
+    # Do not automatically retry an ambiguous call request: a retry can dial the same user twice.
+    client = provider_http_client
+    try:
+        if client is None:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=15.0),
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=20.0),
+            ) as temporary_client:
+                response = await temporary_client.post(f"{CALL_API_BASE}/call", data=payload)
+        elif provider_call_semaphore is not None:
+            async with provider_call_semaphore:
+                response = await client.post(f"{CALL_API_BASE}/call", data=payload)
+        else:
+            response = await client.post(f"{CALL_API_BASE}/call", data=payload)
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+        raise
+    except httpx.TimeoutException:
+        # A read timeout can happen after the provider has accepted the call.
+        return {"status": "accepted_unconfirmed", "message": "Provider response timed out after sending the request; final result is unknown.", "response_type": "timeout"}
+
+    body = response.text or ""
+    content_type = (response.headers.get("content-type") or "").lower()
+    try:
+        data = response.json()
+        if not isinstance(data, dict):
             data = None
-        looks_html = "text/html" in content_type or body.lstrip().lower().startswith(("<!doctype html", "<html", "&lt;!doctype html", "&lt;html")) or "<title>server error</title>" in body.lower() or "&lt;title&gt;server error" in body.lower()
-        if data is None and looks_html:
-            # Some upstreams can dispatch the call and then fail while rendering their response.
-            # Keep the request charged and mark it unconfirmed rather than showing raw HTML or false failure.
-            return {"status": "accepted_unconfirmed", "message": "Provider did not return JSON; request status is unconfirmed.", "http_code": response.status_code, "response_type": "html"}
-        if data is None:
-            return {"status": "error", "message": "Provider returned an unreadable response. Raw output hidden.", "http_code": response.status_code, "response_type": "unknown"}
-        provider_status = str(data.get("status", "")).strip().lower()
-        success_statuses = {"success", "succeeded", "completed"}
-        failure_statuses = {"error", "failed", "failure", "rejected", "denied", "cancelled", "canceled"}
-        if response.status_code < 400 and provider_status in success_statuses:
-            data["status"] = "success"
-            data["message"] = clean_provider_message(data.get("message") or "Success")
-            data["http_code"] = response.status_code
-            return data
-        if provider_status in failure_statuses:
-            return {"status": "error", "message": clean_provider_message(data.get("message") or "Provider rejected the request."), "http_code": response.status_code, "response_type": "json"}
-        if response.status_code >= 500:
-            msg = clean_provider_message(data.get("message"))
-            return {"status": "accepted_unconfirmed", "message": msg or "Provider server response was uncertain; final status is not available.", "http_code": response.status_code, "response_type": "json", "data": data.get("data")}
+    except Exception:
+        data = None
+
+    body_lower = body.lstrip().lower()
+    looks_html = (
+        "text/html" in content_type
+        or body_lower.startswith(("<!doctype html", "<html", "&lt;!doctype html", "&lt;html"))
+        or "<title>server error</title>" in body_lower
+        or "&lt;title&gt;server error" in body_lower
+    )
+
+    # This provider has been observed to return a server HTML page after a call was actually placed.
+    # Never expose the HTML, retry automatically, or refund on an ambiguous 5xx response.
+    if response.status_code >= 500 or (data is None and looks_html):
+        return {
+            "status": "accepted_unconfirmed",
+            "message": "Provider returned a server error/non-JSON reply. The call may have been accepted; status is unconfirmed.",
+            "http_code": response.status_code,
+            "response_type": "html" if looks_html else "server_error",
+        }
+    if data is None:
         if response.status_code >= 400:
-            return {"status": "error", "message": clean_provider_message(data.get("message") or f"Provider HTTP {response.status_code}"), "http_code": response.status_code}
-        # HTTP 2xx with accepted/ok/pending/unknown status is not a confirmed call success.
-        data["status"] = "accepted_unconfirmed"
-        data["message"] = clean_provider_message(data.get("message") or "Provider did not return an explicit success status.")
+            return {"status": "error", "message": f"Provider HTTP {response.status_code}; raw response hidden.", "http_code": response.status_code}
+        return {"status": "accepted_unconfirmed", "message": "Provider returned an unreadable response; final status is unconfirmed.", "http_code": response.status_code, "response_type": "unknown"}
+
+    nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+    raw_status = data.get("status", data.get("result", nested.get("status", "")))
+    provider_status = str(raw_status).strip().lower()
+    explicit_success = (
+        data.get("success") is True
+        or data.get("ok") is True
+        or provider_status in {"success", "succeeded", "completed"}
+        or (isinstance(raw_status, (int, float)) and raw_status == 1)
+        or provider_status == "true"
+    )
+    explicit_failure = (
+        data.get("success") is False
+        or data.get("ok") is False
+        or provider_status in {"error", "failed", "failure", "rejected", "denied", "cancelled", "canceled"}
+    )
+    if explicit_failure:
+        return {
+            "status": "error",
+            "message": clean_provider_message(data.get("message") or nested.get("message") or "Provider rejected the request."),
+            "http_code": response.status_code,
+            "response_type": "json",
+        }
+    if response.status_code < 400 and explicit_success:
+        data["status"] = "success"
+        data["message"] = clean_provider_message(data.get("message") or nested.get("message") or "Provider confirmed success")
         data["http_code"] = response.status_code
         return data
+    if response.status_code >= 400:
+        return {"status": "error", "message": clean_provider_message(data.get("message") or f"Provider HTTP {response.status_code}"), "http_code": response.status_code}
+    data["status"] = "accepted_unconfirmed"
+    data["message"] = clean_provider_message(data.get("message") or nested.get("message") or "Provider did not return an explicit success status.")
+    data["http_code"] = response.status_code
+    return data
+
 
 async def account_api(endpoint: str) -> dict:
     try:
@@ -2934,6 +3002,79 @@ async def healthz():
     return {"ok": True, "service": "custom-call-bot", "time": now().isoformat()}
 
 
+@app.api_route("/provider-audio/{token}/audio.{extension}", methods=["GET", "HEAD"])
+async def provider_audio_proxy(token: str, extension: str, request: Request):
+    """Serve a short-lived Telegram audio file URL to the call provider, without Firebase Storage."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,100}", token or ""):
+        raise HTTPException(status_code=404, detail="Audio link not found")
+    extension = (extension or "").lower()
+    if extension not in {"mp3", "wav", "ogg"}:
+        raise HTTPException(status_code=404, detail="Audio format not supported")
+    if telegram_app is None:
+        raise HTTPException(status_code=503, detail="Audio service is starting")
+
+    try:
+        token_ref = db.collection(COL_PROVIDER_AUDIO).document(token)
+        snap = await asyncio.to_thread(token_ref.get)
+        metadata = snap.to_dict() if snap.exists else {}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Audio lookup temporarily unavailable")
+    if not metadata or metadata.get("extension") != extension:
+        raise HTTPException(status_code=404, detail="Audio link not found")
+    expiry = parse_datetime(metadata.get("expires_at"))
+    if expiry is None or expiry <= now():
+        try:
+            await asyncio.to_thread(token_ref.delete)
+        except Exception:
+            pass
+        raise HTTPException(status_code=410, detail="Audio link expired")
+    file_id = clean_text(metadata.get("file_id"), 500)
+    if not file_id:
+        raise HTTPException(status_code=404, detail="Audio file unavailable")
+
+    content_types = {"mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg"}
+    head_headers = {
+        "Content-Disposition": f'inline; filename="audio.{extension}"',
+        "Cache-Control": "private, no-store, max-age=0",
+        "X-Content-Type-Options": "nosniff",
+    }
+    stored_size = _safe_int(metadata.get("file_size"))
+    if stored_size is not None and stored_size > 0:
+        head_headers["Content-Length"] = str(stored_size)
+    if request.method.upper() == "HEAD":
+        return Response(status_code=200, media_type=content_types[extension], headers=head_headers)
+
+    try:
+        if audio_proxy_semaphore is not None:
+            async with audio_proxy_semaphore:
+                telegram_file = await telegram_app.bot.get_file(file_id)
+                downloaded = await telegram_file.download_as_bytearray()
+        else:
+            telegram_file = await telegram_app.bot.get_file(file_id)
+            downloaded = await telegram_file.download_as_bytearray()
+        payload = bytes(downloaded)
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not retrieve audio from Telegram")
+
+    # Prevent unexpectedly large audio transfers from consuming worker memory.
+    if not payload or len(payload) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio file is empty or exceeds 15 MB")
+    try:
+        await asyncio.to_thread(token_ref.update, {"fetches": firestore.Increment(1), "last_fetched_at": now()})
+    except Exception:
+        pass
+    return Response(
+        content=payload,
+        media_type=content_types[extension],
+        headers={
+            "Content-Disposition": f'inline; filename="audio.{extension}"',
+            "Cache-Control": "private, no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Length": str(len(payload)),
+        },
+    )
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     if TELEGRAM_WEBHOOK_SECRET:
@@ -2944,7 +3085,7 @@ async def telegram_webhook(request: Request):
         raise HTTPException(status_code=503, detail="Bot not initialized")
     payload = await request.json()
     update = Update.de_json(payload, telegram_app.bot)
-    await telegram_app.process_update(update)
+    await telegram_app.update_queue.put(update)
     return {"ok": True}
 
 
@@ -3052,9 +3193,16 @@ async def provider_call_webhook(request: Request):
 
 @app.on_event("startup")
 async def startup():
-    global telegram_app, channel_recheck_task
+    global telegram_app, channel_recheck_task, provider_http_client, provider_call_semaphore, audio_proxy_semaphore
     ensure_settings()
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    provider_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=15.0),
+        follow_redirects=True,
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=20.0),
+    )
+    provider_call_semaphore = asyncio.Semaphore(20)
+    audio_proxy_semaphore = asyncio.Semaphore(8)
+    telegram_app = Application.builder().token(BOT_TOKEN).concurrent_updates(32).build()
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("admin", admin_command))
     telegram_app.add_handler(CommandHandler("call", call_command))
@@ -3096,7 +3244,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global telegram_app, channel_recheck_task
+    global telegram_app, channel_recheck_task, provider_http_client, provider_call_semaphore, audio_proxy_semaphore
     if channel_recheck_task:
         channel_recheck_task.cancel()
         try:
@@ -3112,6 +3260,14 @@ async def shutdown():
             await telegram_app.shutdown()
         except Exception:
             pass
+    if provider_http_client is not None:
+        try:
+            await provider_http_client.aclose()
+        except Exception:
+            pass
+        provider_http_client = None
+    provider_call_semaphore = None
+    audio_proxy_semaphore = None
 
 
 if __name__ == "__main__":
