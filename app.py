@@ -309,6 +309,13 @@ DEFAULT_SETTINGS = {
     "welcome_bonus": 1.0,
     "bkash_number": "01819202231",
     "nagad_number": "01819202231",
+    "rocket_number": "",
+    "bkash_enabled": True,
+    "nagad_enabled": True,
+    "rocket_enabled": False,
+    "bkash_action": "send_money",
+    "nagad_action": "send_money",
+    "rocket_action": "send_money",
     "payment_number": "01819202231",
     "payment_review_chat_id": PAYMENT_REVIEW_CHAT_ID or "@ffxemon",
     "purchase_limit_count": 3,
@@ -465,11 +472,23 @@ def get_settings() -> dict:
         merged["packages"] = list(DEFAULT_SETTINGS["packages"])
     if not isinstance(merged.get("payment_methods"), list):
         merged["payment_methods"] = list(DEFAULT_SETTINGS["payment_methods"])
-    # Derive payment-method list from independently editable numbers.
-    merged["payment_methods"] = [
-        {"name": "bKash", "key": "bkash", "account": str(merged.get("bkash_number", "")).strip()},
-        {"name": "Nagad", "key": "nagad", "account": str(merged.get("nagad_number", "")).strip()},
-    ]
+    # Keep each payment method independently configurable and safely disabled when empty.
+    method_specs = (
+        ("bkash", "bKash"),
+        ("nagad", "Nagad"),
+        ("rocket", "Rocket"),
+    )
+    merged["payment_methods"] = []
+    for method_key, method_name in method_specs:
+        number = str(merged.get(f"{method_key}_number", "") or "").strip()
+        enabled = bool(merged.get(f"{method_key}_enabled", method_key != "rocket")) and bool(number)
+        action = str(merged.get(f"{method_key}_action", "send_money") or "send_money").strip().lower()
+        if action not in {"payment", "send_money", "cash_out"}:
+            action = "send_money"
+        merged["payment_methods"].append({
+            "name": method_name, "key": method_key, "account": number,
+            "enabled": enabled, "action": action,
+        })
     return merged
 
 def save_settings(data: dict):
@@ -943,24 +962,20 @@ def referral_keyboard(referral_link: str):
 
 
 def main_keyboard(user_id: int):
-    """A message-attached inline dashboard, not a persistent reply keyboard.
-
-    Reply keyboards can keep the phone's text-entry UI open and obscure Android
-    navigation. Inline buttons keep the dashboard usable without replacing the
-    user's normal input/navigation controls.
-    """
+    """Single bottom dashboard keyboard; never attach a second inline dashboard."""
     rows = [
-        [InlineKeyboardButton("📞 Send Call", callback_data="menu:call", style="success"), InlineKeyboardButton("👤 My Profile", callback_data="menu:profile", style="primary")],
-        [InlineKeyboardButton("👥 Refer", callback_data="menu:refer", style="primary"), InlineKeyboardButton("📊 LP Statistics", callback_data="menu:stats", style="primary")],
-        [InlineKeyboardButton("💰 Buy Credits", callback_data="menu:buy", style="success"), InlineKeyboardButton("🎁 Redeem", callback_data="menu:redeem", style="danger")],
-        [InlineKeyboardButton("🕘 Call History", callback_data="menu:history", style="primary"), InlineKeyboardButton("☎️ Support", callback_data="menu:support", style="danger")],
+        [KeyboardButton("📞 Send Call"), KeyboardButton("👤 My Profile")],
+        [KeyboardButton("👥 Refer"), KeyboardButton("📊 LP Statistics")],
+        [KeyboardButton("💰 Buy Credits"), KeyboardButton("🎁 Redeem")],
+        [KeyboardButton("🕘 Call History"), KeyboardButton("☎️ Support")],
     ]
     settings = get_settings()
     if settings.get("daily_bonus_enabled", False):
-        rows.append([InlineKeyboardButton("🎁 Daily Bonus", callback_data="daily:claim", style="success")])
+        rows.append([KeyboardButton("🎁 Daily Bonus")])
     if is_admin(user_id):
-        rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin:menu", style="danger")])
-    return InlineKeyboardMarkup(rows)
+        rows.append([KeyboardButton("🛠 Admin Panel")])
+    # No input_field_placeholder: do not force the unwanted “Choose an option” text.
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
 
 def back_button():
     # Keep navigation in the standard Telegram chat keyboard; do not add a fake exit/back button.
@@ -1176,21 +1191,25 @@ def strip_markdown_for_fallback(text: str) -> str:
 
 
 async def edit_or_send(query, text: str, markup=None, parse_mode="Markdown"):
-    # All bot navigation uses message-attached inline buttons. This avoids a persistent
-    # reply keyboard that can interfere with Android's normal input/navigation controls.
-    if markup is None and getattr(query, "from_user", None):
-        try:
-            markup = main_keyboard(query.from_user.id)
-        except Exception:
-            markup = None
-    # Legacy reply keyboards, if any, must be sent as a new message.
+    # Reply keyboards must be sent on a message, while inline buttons belong to a message.
+    # Never auto-attach the dashboard to submenu messages: the dashboard exists only below.
     if isinstance(markup, ReplyKeyboardMarkup):
+        try:
+            if getattr(query, "message", None):
+                await query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         try:
             await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=markup)
             return
         except Exception:
             await query.message.reply_text(strip_markdown_for_fallback(text), reply_markup=markup)
             return
+    if markup is None:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
     try:
         await query.edit_message_text(text, parse_mode=parse_mode, reply_markup=markup)
         return
@@ -1200,7 +1219,6 @@ async def edit_or_send(query, text: str, markup=None, parse_mode="Markdown"):
         await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=markup)
         return
     except Exception:
-        # Last-resort plain text fallback prevents parse-entity errors from hiding the response.
         await query.message.reply_text(strip_markdown_for_fallback(text), reply_markup=markup)
 
 
@@ -1288,11 +1306,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 *LP Statistics*", "",
             f"Users: *{totals['users']}*",
             f"Total Calls: *{totals['calls']}*",
-            f"Successful Calls: *{totals['success']}*",
-            f"Failed Calls: *{totals['failed']}*",
-            "", "🏆 *Top Credit Holders*",
+                "", "🏆 *Top Credit Holders*",
         ]
-        top_users = [item for item in totals.get("top_users", []) if credits_float(item.get("balance", 0)) > 0][:5]
+        top_users = [item for item in totals.get("top_users", []) if credits_float(item.get("balance", 0)) > 0][:10]
         if top_users:
             for rank, item in enumerate(top_users, 1):
                 name = escape_markdown(item.get("name") or "User", version=1)
@@ -1304,7 +1320,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu:history":
         docs = list(db.collection(COL_CALLS).where("user_id", "==", user_id).limit(50).stream())
-        items = sorted(docs, key=lambda snap: str((snap.to_dict() or {}).get("created_at") or ""), reverse=True)[:10]
+        items = sorted(docs, key=lambda snap: str((snap.to_dict() or {}).get("created_at") or ""), reverse=True)[:5]
         if not items:
             await edit_or_send(query, "📞 *কলের ইতিহাস*\n\nএখনো কোনো কলের ইতিহাস নেই।", back_button())
             return
@@ -1312,10 +1328,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for snap in items:
             c = snap.to_dict() or {}
             status = str(c.get("status", "unknown")).upper()
-            number = str(c.get("number", ""))[-4:]
+            number = clean_text(c.get("number", ""), 30) or "অজানা"
             when = iso(c.get("created_at")) or "-"
             safe_status = escape_markdown(status, version=1)
-            lines.append(f"• `****{number}` — *{safe_status}* — {when[:16]}")
+            lines.append(f"• `{escape_markdown(number, version=1)}` — *{safe_status}* — {when[:16]}")
             if c.get("recording_url"):
                 lines.append(f"  Recording: `{escape_markdown(clean_text(c.get('recording_url'), 300), version=1)}`")
         await edit_or_send(query, "\n".join(lines), back_button())
@@ -1457,14 +1473,15 @@ async def show_buy(query, context):
     packages = settings.get("packages", [])
     rows = [[InlineKeyboardButton(clean_text(p.get("label", f"{p.get('credits')} Calls"), 60), callback_data=f"buy:{p.get('id')}", style="success" if i % 2 == 0 else "primary")] for i, p in enumerate(packages)]
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:home", style="primary")])
-    bkash = clean_text(settings.get("bkash_number", ""), 40) or "Not set"
-    nagad = clean_text(settings.get("nagad_number", ""), 40) or "Not set"
     package_lines = "\n".join(f"• {clean_text(pkg.get('label'), 100)}" for pkg in packages)
+    enabled_names = [m["name"] for m in settings.get("payment_methods", []) if m.get("enabled")]
+    methods_text = ", ".join(enabled_names) if enabled_names else "এখন কোনো পেমেন্ট মাধ্যম চালু নেই"
     text = (
         "💰 *Credit Purchase*\n━━━━━━━━━━━━━━━━━\n\n"
         "📦 *Available Packages:*\n\n" + package_lines +
         "\n━━━━━━━━━━━━━━━━━\n"
-        f"💳 bKash: *{bkash}*\n💳 Nagad: *{nagad}*\n"
+        f"💳 পেমেন্ট মাধ্যম: *{methods_text}*\n"
+        "প্যাকেজ নির্বাচন করার পর পেমেন্ট নম্বর দেখানো হবে।\n"
         "⚡ অ্যাডমিন অনুমোদন দিলে ক্রেডিট স্বয়ংক্রিয়ভাবে যোগ হবে।\n\n"
         "👇 নিচের প্যাকেজ নির্বাচন করুন।"
     )
@@ -1498,20 +1515,32 @@ async def select_package(query, context, pkg_id: str):
         return
     context.user_data["payment_package"] = package
     methods = []
-    if clean_text(settings.get("bkash_number"), 40):
-        methods.append([InlineKeyboardButton("💗 Pay with bKash", callback_data="paymethod:bkash", style="success")])
-    if clean_text(settings.get("nagad_number"), 40):
-        methods.append([InlineKeyboardButton("🧡 Pay with Nagad", callback_data="paymethod:nagad", style="primary")])
-    methods.append([InlineKeyboardButton("⬅️ Cancel", callback_data="menu:buy")])
+    payment_labels = {"bkash": "💗 bKash", "nagad": "🧡 Nagad", "rocket": "🚀 Rocket"}
+    action_labels = {"payment": "Payment", "send_money": "Send Money", "cash_out": "Cash Out"}
+    number_lines = []
+    for method in settings.get("payment_methods", []):
+        if not method.get("enabled") or not clean_text(method.get("account"), 40):
+            continue
+        key = clean_text(method.get("key"), 20).lower()
+        name = payment_labels.get(key, clean_text(method.get("name", key), 30))
+        action_label = action_labels.get(method.get("action"), "Send Money")
+        account = clean_text(method.get("account"), 40)
+        number_lines.append(f"• {name} — {action_label}: *{account}*")
+        methods.append([
+            InlineKeyboardButton(f"{name} · {action_label}", callback_data=f"paymethod:{key}", style="success" if key == "bkash" else "primary"),
+            InlineKeyboardButton("📋 নম্বর কপি", copy_text=CopyTextButton(text=account), style="success"),
+        ])
+    methods.append([InlineKeyboardButton("⬅️ বাতিল", callback_data="menu:buy", style="primary")])
     if len(methods) == 1:
-        await edit_or_send(query, "❌ অ্যাডমিন এখনো কোনো পেমেন্ট নম্বর সেট করেননি।", back_button())
+        await edit_or_send(query, "❌ অ্যাডমিন এখনো কোনো পেমেন্ট মাধ্যম চালু করেননি।", back_button())
         return
     await edit_or_send(
         query,
         f"📦 *{clean_text(package.get('label'),100)}*\n"
         f"ক্রেডিট: *{credits_float(package.get('credits', 0)):g}*\n"
         f"মূল্য: *{int(package.get('price', 0))} TK*\n\n"
-        "পেমেন্টের মাধ্যম নির্বাচন করুন:",
+        "💳 *পেমেন্ট নম্বর*\n" + "\n".join(number_lines) + "\n\n"
+        "সঠিক নম্বরে প্রদর্শিত লেনদেনের ধরন অনুযায়ী টাকা পাঠান। নম্বর কপি করতে পাশের বাটনে চাপ দিন, অথবা পেমেন্ট মাধ্যম নির্বাচন করে Transaction ID জমা দিন।",
         InlineKeyboardMarkup(methods),
     )
 
@@ -1521,19 +1550,35 @@ async def select_payment_method(query, context, method: str):
     if not package:
         await edit_or_send(query, "প্যাকেজের সেশন শেষ হয়েছে। Buy Credits আবার খুলুন।", back_button())
         return
-    key = "bkash_number" if method == "bkash" else "nagad_number" if method == "nagad" else None
-    if not key:
-        await edit_or_send(query, "পেমেন্টের মাধ্যম সঠিক নয়।", back_button())
-        return
+    method = clean_text(method, 20).lower()
     settings = get_settings()
-    number = clean_text(settings.get(key), 40)
-    if not number:
-        await edit_or_send(query, f"{method.title()} পেমেন্ট আপাতত বন্ধ। অন্য মাধ্যম ব্যবহার করুন।", back_button())
+    method_data = next((item for item in settings.get("payment_methods", []) if item.get("key") == method), None)
+    if not method_data or not method_data.get("enabled"):
+        await edit_or_send(query, "এই পেমেন্ট মাধ্যমটি বর্তমানে বন্ধ। অন্য মাধ্যম নির্বাচন করুন।", back_button())
         return
+    number = clean_text(method_data.get("account"), 40)
+    if not number:
+        await edit_or_send(query, "এই পেমেন্ট মাধ্যমের নম্বর সেট করা নেই।", back_button())
+        return
+    action = str(method_data.get("action", "send_money"))
+    action_label = {"payment": "Payment", "send_money": "Send Money", "cash_out": "Cash Out"}.get(action, "Send Money")
     context.user_data["payment_method"] = method
     context.user_data["payment_number"] = number
+    context.user_data["payment_action"] = action
     context.user_data["state"] = "payment_txn"
-    await edit_or_send(query, f"💳 *{method.title()} পেমেন্ট*\n\nটাকা পাঠান: *{number}*\nপ্যাকেজ: *{clean_text(package.get('label'),100)}*\nমূল্য: *{int(package.get('price',0))} TK*\n\nপেমেন্ট সম্পন্ন করে Transaction ID পাঠান। একই Transaction ID দ্বিতীয়বার গ্রহণ করা হবে না।", back_button())
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 নম্বর কপি করুন", copy_text=CopyTextButton(text=number), style="success")],
+        [InlineKeyboardButton("⬅️ অন্য পেমেন্ট মাধ্যম", callback_data=f"buy:{package.get('id')}", style="primary")],
+    ])
+    await edit_or_send(
+        query,
+        f"💳 *{clean_text(method_data.get('name'), 30)} — {action_label}*\n\n"
+        f"পেমেন্ট নম্বর: *{number}*\n"
+        f"প্যাকেজ: *{clean_text(package.get('label'),100)}*\n"
+        f"মূল্য: *{int(package.get('price',0))} TK*\n\n"
+        f"উপরের নম্বরে {action_label} করুন। তারপর Transaction ID পাঠান। একই Transaction ID দ্বিতীয়বার গ্রহণ করা হবে না।",
+        markup,
+    )
 
 async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str):
     user = update.effective_user
@@ -1582,8 +1627,6 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
             "📊 LP Statistics", "━━━━━━━━━━━━━━━━━",
             f"Users: {totals['users']}",
             f"Total Calls: {totals['calls']}",
-            f"Successful Calls: {totals['success']}",
-            f"Failed Calls: {totals['failed']}",
             "", "🏆 Top Credit Holders",
         ]
         top_users = [item for item in totals.get("top_users", []) if credits_float(item.get("balance", 0)) > 0]
@@ -1598,13 +1641,15 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
     if label == "💰 Buy Credits":
         packages = settings.get("packages", [])
         rows = [[InlineKeyboardButton(clean_text(pkg.get("label", f"{pkg.get('credits')} Calls"), 60), callback_data=f"buy:{pkg.get('id')}", style="success" if i % 2 == 0 else "primary")] for i, pkg in enumerate(packages)]
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:home", style="primary")])
+        rows.append([InlineKeyboardButton("⬅️ বাতিল", callback_data="menu:home", style="primary")])
         package_lines = "\n".join(f"• {html.escape(clean_text(pkg.get('label'), 100))}" for pkg in packages)
+        enabled_names = [html.escape(str(item.get("name", ""))) for item in settings.get("payment_methods", []) if item.get("enabled")]
+        methods_text = ", ".join(enabled_names) if enabled_names else "কোনো পেমেন্ট মাধ্যম চালু নেই"
         text = (
             "💰 <b>ক্রেডিট কিনুন</b>\n━━━━━━━━━━━━━━━━━\n\n"
             "📦 <b>উপলভ্য প্যাকেজ:</b>\n\n" + package_lines + "\n━━━━━━━━━━━━━━━━━\n"
-            f"💳 বিকাশ: <b>{html.escape(clean_text(settings.get('bkash_number') or 'সেট করা নেই', 40))}</b>\n"
-            f"💳 নগদ: <b>{html.escape(clean_text(settings.get('nagad_number') or 'সেট করা নেই', 40))}</b>\n"
+            f"💳 <b>চালু পেমেন্ট মাধ্যম:</b> {methods_text}\n"
+            "প্যাকেজ নির্বাচন করার পরেই পেমেন্ট নম্বর দেখানো হবে।\n"
             "⚡ অ্যাডমিন অনুমোদন দিলে ক্রেডিট স্বয়ংক্রিয়ভাবে যোগ হবে।\n\n👇 নিচের প্যাকেজ নির্বাচন করুন:"
         )
         await message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
@@ -1622,10 +1667,10 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
             await message.reply_text("📞 কলের ইতিহাস\nএখনো কোনো কলের ইতিহাস নেই।", reply_markup=keyboard)
             return
         lines = ["📞 Recent Calls"]
-        for snap in docs[:10]:
+        for snap in docs[:5]:
             record = snap.to_dict() or {}
-            number = str(record.get("number", ""))[-4:]
-            lines.append(f"• ****{number} — {str(record.get('status', 'unknown')).upper()} — {iso(record.get('created_at')) or '-'}")
+            number = clean_text(record.get("number", ""), 30) or "অজানা"
+            lines.append(f"• {number} — {str(record.get('status', 'unknown')).upper()} — {iso(record.get('created_at')) or '-'}")
         await message.reply_text("\n".join(lines), reply_markup=keyboard)
         return
 
@@ -2329,7 +2374,8 @@ async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_T
     package = context.user_data.get("payment_package")
     method = context.user_data.get("payment_method")
     number = context.user_data.get("payment_number")
-    if not package or method not in {"bkash", "nagad"} or not number:
+    payment_action = clean_text(context.user_data.get("payment_action", "send_money"), 30)
+    if not package or method not in {"bkash", "nagad", "rocket"} or not number:
         await update.effective_message.reply_text("❌ কেনাকাটার সেশন শেষ হয়েছে। Buy Credits আবার খুলুন।")
         context.user_data.clear()
         return
@@ -2360,7 +2406,8 @@ async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_T
         "first_name": clean_text(user.first_name, 100), "package_id": package.get("id"),
         "package_label": package.get("label"), "credits": credits_float(package.get("credits", 0)),
         "price": int(package.get("price", 0)), "transaction_id": txn_id,
-        "payment_method": method, "payment_number": clean_text(number, 40),
+        "payment_method": method, "payment_action": payment_action,
+        "payment_number": clean_text(number, 40),
         "status": "pending", "created_at": now(), "updated_at": now(),
     }
     ref.set(payload)
@@ -2373,6 +2420,7 @@ async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_T
         f"🆔 Request: `{ref.id}`\n👤 User: {display_name} (@{uname})\n🪪 Telegram ID: `{user_id}`\n"
         f"📦 Package: {escape_markdown(clean_text(package.get('label'), 120), version=1)}\n"
         f"💳 Amount: *৳{int(package.get('price', 0))}*\n📱 Method: *{method.title()}*\n"
+        f"📱 Action: *{payment_action}*\n"
         f"📱 Payment Number: `{clean_text(number,40)}`\n🧾 Transaction ID: `{txn_id}`\n"
         "━━━━━━━━━━━━━━━━━\nVerify payment manually before approval. Credits will be added only once."
     )
@@ -2390,11 +2438,13 @@ async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
     confirmation = (
-        "✅ Payment request saved.\n"
+        "✅ পেমেন্ট অনুরোধ সংরক্ষণ করা হয়েছে।\n"
         f"🆔 Request ID: {ref.id}\n"
         "⏳ পেমেন্ট যাচাইয়ের অপেক্ষায় আছে। অ্যাডমিন অনুমোদন দিলে ক্রেডিট স্বয়ংক্রিয়ভাবে যোগ হবে।"
     )
-    await update.effective_message.reply_text(confirmation, reply_markup=main_keyboard(user_id))
+    copy_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Request ID কপি করুন", copy_text=CopyTextButton(text=ref.id), style="success")]])
+    await update.effective_message.reply_text(confirmation, reply_markup=copy_markup)
+    await update.effective_message.reply_text("নিচের মেনু থেকে পরবর্তী সুবিধা বেছে নিন।", reply_markup=main_keyboard(user_id))
 
 async def local_stats() -> dict:
     user_docs = list(db.collection(COL_USERS).stream())
@@ -2414,7 +2464,7 @@ async def local_stats() -> dict:
     return {
         "users": len(valid_users), "calls": len(calls), "success": success, "failed": failed,
         "credits": credits,
-        "top_users": sorted([item for item in valid_users if item["balance"] > 0], key=lambda item: item["balance"], reverse=True)[:5],
+        "top_users": sorted([item for item in valid_users if item["balance"] > 0], key=lambda item: item["balance"], reverse=True)[:10],
     }
 
 def admin_keyboard_markup():
@@ -2428,6 +2478,8 @@ def admin_keyboard_markup():
         [InlineKeyboardButton("💰 Payments", callback_data="admin:payments", style="success"), InlineKeyboardButton("📞 Call Logs", callback_data="admin:calls", style="primary")],
         [InlineKeyboardButton("📣 Broadcast", callback_data="admin:broadcast", style="primary"), InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings", style="primary")],
         [InlineKeyboardButton("💗 bKash Number", callback_data="admin:bkash_number", style="success"), InlineKeyboardButton("🧡 Nagad Number", callback_data="admin:nagad_number", style="danger")],
+        [InlineKeyboardButton("🚀 Rocket Number", callback_data="admin:rocket_number", style="primary"), InlineKeyboardButton("⚙️ Payment Actions", callback_data="admin:paymentactions", style="primary")],
+        [InlineKeyboardButton(f"bKash {'ON' if settings.get('bkash_enabled', True) else 'OFF'}", callback_data="admin:toggle_payment:bkash", style="success" if settings.get('bkash_enabled', True) else "danger"), InlineKeyboardButton(f"Nagad {'ON' if settings.get('nagad_enabled', True) else 'OFF'}", callback_data="admin:toggle_payment:nagad", style="success" if settings.get('nagad_enabled', True) else "danger"), InlineKeyboardButton(f"Rocket {'ON' if settings.get('rocket_enabled', False) else 'OFF'}", callback_data="admin:toggle_payment:rocket", style="success" if settings.get('rocket_enabled', False) else "danger")],
         [InlineKeyboardButton(f"🎁 Daily Bonus: {daily_state}", callback_data="admin:toggle_daily", style="success" if settings.get("daily_bonus_enabled", False) else "danger")],
         [InlineKeyboardButton(f"🛠 Call Maintenance: {'ON' if settings.get('maintenance', False) else 'OFF'}", callback_data="admin:toggle_maintenance", style="danger" if settings.get("maintenance", False) else "success")],
         [InlineKeyboardButton("📦 Edit Packages", callback_data="admin:packages", style="primary"), InlineKeyboardButton("🔎 User Info", callback_data="admin:userinfo", style="primary")],
@@ -2553,7 +2605,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for s in docs:
             c = s.to_dict() or {}
             lines.append(
-                f"`{str(c.get('user_id'))}` — ****{str(c.get('number',''))[-4:]} — "
+                f"`{str(c.get('user_id'))}` — `{clean_text(c.get('number',''), 30)}` — "
                 f"{str(c.get('status'))} — {str(c.get('mode'))} — {clean_text(c.get('template_title') or '', 50)}"
             )
             if c.get("audio_source"):
@@ -2612,6 +2664,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Daily bonus enabled: *{bool(s.get('daily_bonus_enabled', False))}*\n"
             f"bKash number: `{clean_text(s.get('bkash_number', ''), 40) or 'Not set'}`\n"
             f"Nagad number: `{clean_text(s.get('nagad_number', ''), 40) or 'Not set'}`\n"
+            f"Rocket number: `{clean_text(s.get('rocket_number', ''), 40) or 'Not set'}`\n"
+            f"Payment methods: `bKash={bool(s.get('bkash_enabled'))}, Nagad={bool(s.get('nagad_enabled'))}, Rocket={bool(s.get('rocket_enabled'))}`\n"
             f"Review group: `{clean_text(s.get('payment_review_chat_id', PAYMENT_REVIEW_CHAT_ID), 100)}`\n"
             f"Required channel: `{clean_text(s.get('required_channel', REQUIRED_CHANNEL_USERNAME), 100)}`\n\n"
             "Use /help for all settings and commands."
@@ -2619,12 +2673,46 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = [
             [InlineKeyboardButton("💗 Set bKash Number", callback_data="admin:bkash_number")],
             [InlineKeyboardButton("🧡 Set Nagad Number", callback_data="admin:nagad_number")],
+            [InlineKeyboardButton("🚀 Set Rocket Number", callback_data="admin:rocket_number")],
+            [InlineKeyboardButton("⚙️ Payment Actions", callback_data="admin:paymentactions")],
             [InlineKeyboardButton("🎁 Toggle Daily Bonus", callback_data="admin:toggle_daily")],
             [InlineKeyboardButton("⬅️ Back to Admin", callback_data="admin:menu", style="primary")],
         ]
         await edit_or_send(query, text, InlineKeyboardMarkup(rows))
-    elif action in {"paymentnumber", "bkash_number", "nagad_number"}:
-        method = "bkash" if action in {"paymentnumber", "bkash_number"} else "nagad"
+    elif action == "paymentactions":
+        settings = get_settings()
+        rows = []
+        action_options = [("payment", "Payment"), ("send_money", "Send Money"), ("cash_out", "Cash Out")]
+        for method_key, method_name in (("bkash", "bKash"), ("nagad", "Nagad"), ("rocket", "Rocket")):
+            active = str(settings.get(f"{method_key}_action", "send_money"))
+            rows.append([InlineKeyboardButton(f"{method_name}: {label} {'✅' if active == value else ''}", callback_data=f"admin:payment_action:{method_key}:{value}", style="success" if active == value else "primary") for value, label in action_options])
+        rows.append([InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin:menu", style="primary")])
+        await edit_or_send(query, "প্রতিটি পেমেন্ট মাধ্যমে কোন ধরনের লেনদেন হবে তা বেছে নিন:", InlineKeyboardMarkup(rows), parse_mode=None)
+    elif action.startswith("toggle_payment:"):
+        method_key = action.split(":", 1)[1]
+        if method_key not in {"bkash", "nagad", "rocket"}:
+            await edit_or_send(query, "পেমেন্ট মাধ্যম সঠিক নয়।", admin_keyboard_markup(), parse_mode=None)
+            return
+        settings = get_settings()
+        key = f"{method_key}_enabled"
+        enabled = not bool(settings.get(key, method_key != "rocket"))
+        if enabled and not clean_text(settings.get(f"{method_key}_number"), 40):
+            await edit_or_send(query, f"আগে {method_key.title()}-এর পেমেন্ট নম্বর সেট করুন, তারপর চালু করুন।", admin_keyboard_markup(), parse_mode=None)
+            return
+        save_settings({key: enabled})
+        audit("payment_method_toggled", query.from_user.id, {"method": method_key, "enabled": enabled})
+        await edit_or_send(query, f"✅ {method_key.title()} payment {'চালু' if enabled else 'বন্ধ'} করা হয়েছে।", admin_keyboard_markup(), parse_mode=None)
+    elif action.startswith("payment_action:"):
+        parts = action.split(":")
+        if len(parts) != 3 or parts[1] not in {"bkash", "nagad", "rocket"} or parts[2] not in {"payment", "send_money", "cash_out"}:
+            await edit_or_send(query, "পেমেন্ট অ্যাকশন সঠিক নয়।", admin_keyboard_markup(), parse_mode=None)
+            return
+        method_key, action_value = parts[1], parts[2]
+        save_settings({f"{method_key}_action": action_value})
+        audit("payment_action_changed", query.from_user.id, {"method": method_key, "action": action_value})
+        await edit_or_send(query, f"✅ {method_key.title()} action set to {action_value.replace('_', ' ')}.", admin_keyboard_markup(), parse_mode=None)
+    elif action in {"paymentnumber", "bkash_number", "nagad_number", "rocket_number"}:
+        method = "bkash" if action == "paymentnumber" else action.removesuffix("_number")
         key = f"{method}_number"
         context.user_data["state"] = f"admin_{method}_number"
         current_number = clean_text(get_settings().get(key, ""), 40) or "Not set"
@@ -2775,8 +2863,8 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
     admin_id = update.effective_user.id
     state = context.user_data.get("state")
 
-    if state in {"admin_bkash_number", "admin_nagad_number", "admin_payment_number"}:
-        method = "nagad" if state == "admin_nagad_number" else "bkash"
+    if state in {"admin_bkash_number", "admin_nagad_number", "admin_rocket_number", "admin_payment_number"}:
+        method = "rocket" if state == "admin_rocket_number" else "nagad" if state == "admin_nagad_number" else "bkash"
         if text.strip().lower() in {"off", "disable", "disabled", "none"}:
             digits = ""
         else:
@@ -2784,10 +2872,10 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
             if not 8 <= len(digits) <= 15:
                 await update.effective_message.reply_text("❌ সঠিক নম্বর দিন (৮–১৫ অঙ্ক), অথবা এই পেমেন্ট মাধ্যম বন্ধ করতে OFF লিখুন।")
                 return
-        save_settings({f"{method}_number": digits, **({"payment_number": digits} if digits else {})})
+        save_settings({f"{method}_number": digits, f"{method}_enabled": bool(digits), **({"payment_number": digits} if digits else {})})
         audit("payment_number_changed", admin_id, {"method": method, "payment_number": digits})
         context.user_data.clear()
-        await update.effective_message.reply_text(f"✅ {method.title()} number update hoyeche: `{digits}`", parse_mode="Markdown", reply_markup=main_keyboard(admin_id))
+        await update.effective_message.reply_text(f"✅ {method.title()} পেমেন্ট নম্বর আপডেট হয়েছে: `{digits or 'বন্ধ'}`", parse_mode="Markdown", reply_markup=main_keyboard(admin_id))
         return
 
     if state in {"admin_addcredits", "admin_deductcredits"}:
@@ -3030,18 +3118,27 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.effective_message.reply_text("Invalid number. call_credit_cost must be greater than 0.")
             return
-    elif key in {"maintenance", "daily_bonus_enabled"}:
+    elif key in {"maintenance", "daily_bonus_enabled", "bkash_enabled", "nagad_enabled", "rocket_enabled"}:
         value = value.lower() in {"1", "true", "on", "yes", "enabled"}
-    elif key in {"payment_number", "bkash_number", "nagad_number"}:
+    elif key in {"payment_number", "bkash_number", "nagad_number", "rocket_number"}:
+        method_key = "bkash" if key == "payment_number" else key.removesuffix("_number")
         if value.lower() in {"off", "disable", "disabled", "none"} and key != "payment_number":
             value = ""
+            save_settings({f"{method_key}_enabled": False})
         else:
             value = re.sub(r"\D+", "", value)
             if not 8 <= len(value) <= 15:
-                await update.effective_message.reply_text("Payment number must contain 8–15 digits (or use OFF for bKash_number/nagad_number).")
+                await update.effective_message.reply_text("Payment number must contain 8–15 digits (or use OFF to disable a method).")
                 return
+            save_settings({f"{method_key}_enabled": True})
         if key == "payment_number":
             key = "bkash_number"
+    elif key in {"bkash_action", "nagad_action", "rocket_action"}:
+        aliases = {"payment": "payment", "send_money": "send_money", "send money": "send_money", "cash_out": "cash_out", "cash out": "cash_out"}
+        value = aliases.get(value.lower())
+        if value is None:
+            await update.effective_message.reply_text("Action must be payment, send_money, or cash_out.")
+            return
     elif key in {"payment_review_chat_id", "required_channel"}:
         value = clean_text(value, 100)
         if not value:
@@ -3103,7 +3200,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/set call_credit_cost 1", "/set daily_call_limit 20", "/set call_cooldown_seconds 15",
             "/set referral_bonus 1", "/set welcome_bonus 1", "/set daily_bonus 1",
             "/set daily_bonus_enabled true", "/set maintenance false",
-            "/set bkash_number 01819202231", "/set nagad_number 01819202231", "/set nagad_number off — নগদ বন্ধ করতে",
+            "/set bkash_number 01819202231", "/set nagad_number 01819202231", "/set rocket_number 01700000000",
+            "/set nagad_number off — নগদ বন্ধ করতে", "/set rocket_action cash_out", "/set bkash_action send_money",
+            "/set bkash_enabled false — বাটন বন্ধ করতে; true দিয়ে চালু করতে", "/set rocket_enabled true — নম্বর সেট করার পর মাধ্যম চালু করতে",
             "/set payment_review_chat_id @ffxemon", "/set required_channel @CyberShunya_x",
             "/set purchase_limit_count 3", "/set purchase_limit_minutes 10",
             "/set package_p50_price 60", "/set package_p100_price 100", "/set support_contact_url tg://user?id=7034779471",
