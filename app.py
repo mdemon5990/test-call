@@ -1,5 +1,6 @@
 
 import os
+import logging
 import re
 import json
 import html
@@ -22,7 +23,12 @@ from firebase_admin import credentials, db as firebase_db
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-from telegram import BotCommand, CopyTextButton, Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from telegram import (
+    BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    CopyTextButton, Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, ReplyKeyboardMarkup,
+)
 from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
@@ -34,6 +40,9 @@ from telegram.ext import (
     filters,
 )
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("custom_call_bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7034779471"))
@@ -283,11 +292,12 @@ COL_PAYMENTS = "payments"
 COL_AUDIT = "audit_logs"
 COL_SETTINGS = "settings"
 COL_PROVIDER_AUDIO = "provider_audio_tokens"
+COL_VOICE_TEMPLATES = "voice_templates"
 
 UTC = timezone.utc
 
 DEFAULT_SETTINGS = {
-    "settings_schema": 3,
+    "settings_schema": 4,
     "brand_name": "Custom Call",
     "maintenance": False,
     "call_credit_cost": 1.0,
@@ -305,9 +315,9 @@ DEFAULT_SETTINGS = {
     "purchase_limit_minutes": 10,
     "required_channel": REQUIRED_CHANNEL_USERNAME,
     "min_redeem_credits": 1.0,
-    "support_text": "Support er jonno niche Message Support Admin button tap koro.",
+    "support_text": "সহায়তার জন্য নিচের ‘Message Support Admin’ বাটনে চাপ দিন।",
     "support_contact_url": SUPPORT_CONTACT_URL,
-    "buy_text": "Package select koro, bKash/Nagad-e payment koro, tarpor Transaction ID submit koro. Admin verify korle credits auto add hobe.",
+    "buy_text": "প্যাকেজ নির্বাচন করুন, বিকাশ/নগদে পেমেন্ট করুন, তারপর Transaction ID পাঠান। অ্যাডমিন যাচাই করে ক্রেডিট যোগ করবেন।",
     "admin_notice": "Please call only people who have agreed to receive the call.",
     "packages": [
         {"id": "p50", "credits": 50, "price": 60, "label": "📞 50 Calls — 60 TK"},
@@ -441,6 +451,13 @@ def get_settings() -> dict:
             "required_channel": REQUIRED_CHANNEL_USERNAME,
             "packages": list(DEFAULT_SETTINGS["packages"]),
         })
+        ref.set(data, merge=True)
+    if (_safe_int(data.get("settings_schema", 0)) or 0) < 4:
+        if data.get("support_text") == "Support er jonno niche Message Support Admin button tap koro.":
+            data["support_text"] = DEFAULT_SETTINGS["support_text"]
+        if data.get("buy_text") == "Package select koro, bKash/Nagad-e payment koro, tarpor Transaction ID submit koro. Admin verify korle credits auto add hobe.":
+            data["buy_text"] = DEFAULT_SETTINGS["buy_text"]
+        data["settings_schema"] = 4
         ref.set(data, merge=True)
     merged = dict(DEFAULT_SETTINGS)
     merged.update(data)
@@ -737,19 +754,19 @@ def membership_keyboard():
     channel = clean_text(get_settings().get("required_channel") or REQUIRED_CHANNEL_USERNAME, 100)
     channel_url = "https://t.me/" + channel.lstrip("@").strip("/")
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Required Channel", url=channel_url)],
-        [InlineKeyboardButton("✅ I Joined — Check Again", callback_data="membership:check")],
+        [InlineKeyboardButton("📢 নির্ধারিত চ্যানেলে যোগ দিন", url=channel_url)],
+        [InlineKeyboardButton("✅ যোগ দিয়েছি — যাচাই করুন", callback_data="membership:check")],
     ])
 
 
 async def show_join_gate(target, context, verification_error: bool = False):
     text = (
-        "🔒 *Channel Join Required*\n\n"
-        f"Please join {escape_markdown(clean_text(get_settings().get('required_channel') or REQUIRED_CHANNEL_USERNAME, 100), version=1)} first. Bot-er kono feature join verify na howa porjonto kaj korbe na.\n\n"
-        "Join korar por *I Joined — Check Again* button tap koro."
+        "🔒 *চ্যানেলে যোগ দেওয়া বাধ্যতামূলক*\n\n"
+        f"প্রথমে {escape_markdown(clean_text(get_settings().get('required_channel') or REQUIRED_CHANNEL_USERNAME, 100), version=1)} চ্যানেলে যোগ দিন। যোগদান যাচাই না হওয়া পর্যন্ত বটের সুবিধাগুলো ব্যবহার করা যাবে না।\n\n"
+        "যোগ দেওয়ার পর *যোগ দিয়েছি — যাচাই করুন* বাটনে চাপ দিন।"
     )
     if verification_error:
-        text += "\n\n⚠️ Verification failed. Admin-ke bot channel-e add kore admin permission dite bolo."
+        text += "\n\n⚠️ যাচাই করা যায়নি। বটকে চ্যানেলে অ্যাডমিন করুন এবং আবার চেষ্টা করুন।"
     markup = membership_keyboard()
     if hasattr(target, "edit_message_text"):
         await edit_or_send(target, text, markup)
@@ -800,7 +817,7 @@ async def complete_pending_referral(user_id: int):
         if telegram_app:
             await telegram_app.bot.send_message(
                 chat_id=referrer_id,
-                text=f"🎉 Referral Bonus: +{bonus:g} credit! Friend channel join complete koreche. More invite koro ar credit jito!",
+                text=f"🎉 রেফারেল বোনাস: +{bonus:g} ক্রেডিট! আপনার আমন্ত্রণে নতুন ব্যবহারকারী চ্যানেলে যোগ দিয়েছেন। আরও বন্ধু আমন্ত্রণ করুন।",
             )
     except Exception:
         pass
@@ -887,33 +904,34 @@ def subscription_badge(tier: str) -> str:
 
 
 def profile_message(user_id: int, user_data: dict) -> str:
-    name = clean_text((str(user_data.get("first_name", "")) + " " + str(user_data.get("last_name", ""))).strip(), 100) or "User"
+    name = html.escape(clean_text((str(user_data.get("first_name", "")) + " " + str(user_data.get("last_name", ""))).strip(), 100) or "ব্যবহারকারী")
+    username = html.escape(clean_text(user_data.get("username") or "নেই", 100))
     balance = credits_float(user_data.get("balance", 0))
     tier = subscription_for_profile(user_data)
     tier_lines = {
-        "INACTIVE": "Purchase a credit package to activate your membership.",
-        "ACTIVE": "Your account is active.",
-        "PRO": "PRO membership active — welcome to the premium club.",
-        "MAX": "MAX membership active — enjoy your premium access.",
-        "VIP": "VIP membership active — thanks for supporting the service.",
-        "ELITE": "ELITE membership active — premium account benefits unlocked.",
-        "LEGEND": "LEGEND membership active — highest current plan unlocked.",
+        "INACTIVE": "সদস্যতা চালু করতে একটি ক্রেডিট প্যাকেজ কিনুন।",
+        "ACTIVE": "আপনার অ্যাকাউন্ট সক্রিয়।",
+        "PRO": "PRO সদস্যতা সক্রিয় — প্রিমিয়াম সুবিধা উপভোগ করুন।",
+        "MAX": "MAX সদস্যতা সক্রিয় — আপনার প্রিমিয়াম সুবিধা চালু আছে।",
+        "VIP": "VIP সদস্যতা সক্রিয় — সেবা ব্যবহারের জন্য ধন্যবাদ।",
+        "ELITE": "ELITE সদস্যতা সক্রিয় — বিশেষ সুবিধা চালু হয়েছে।",
+        "LEGEND": "LEGEND সদস্যতা সক্রিয় — সর্বোচ্চ প্যাকেজ চালু আছে।",
     }
     return (
-        "👤 𝗠𝗬 𝗣𝗥𝗢𝗙𝗜𝗟𝗘\n"
+        "👤 <b>আমার প্রোফাইল</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"👑 Member: {name}\n"
-        f"🪪 Telegram ID: {user_id}\n"
-        f"🔗 Username: @{clean_text(user_data.get('username') or 'none', 100)}\n"
-        f"💳 Credit Balance: {balance:.2f}\n\n"
-        f"🏅 Subscription: {subscription_badge(tier)}\n"
-        f"{tier_lines.get(tier, tier_lines['INACTIVE'])}\n"
+        f"👑 <b>সদস্য:</b> {name}\n"
+        f"🪪 <b>টেলিগ্রাম আইডি:</b> <code>{user_id}</code>\n"
+        f"🔗 <b>ইউজারনেম:</b> @{username}\n"
+        f"💳 <b>ক্রেডিট ব্যালেন্স: {balance:.2f}</b>\n\n"
+        f"🏅 <b>সদস্যতা: {html.escape(subscription_badge(tier))}</b>\n"
+        f"{html.escape(tier_lines.get(tier, tier_lines['INACTIVE']))}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"📞 Total Calls: {_safe_int(user_data.get('total_calls', 0)) or 0}\n"
-        f"✅ Successful Calls: {_safe_int(user_data.get('successful_calls', 0)) or 0}\n"
-        f"❌ Failed Calls: {_safe_int(user_data.get('failed_calls', 0)) or 0}\n"
-        f"👥 Referrals: {_safe_int(user_data.get('referrals', 0)) or 0}\n"
-        f"💠 Lifetime Purchase Tier: {clean_text(user_data.get('subscription_paid_tier', 'NONE'), 30).upper()}\n"
+        f"📞 <b>মোট কল:</b> {_safe_int(user_data.get('total_calls', 0)) or 0}\n"
+        f"✅ <b>সফল কল:</b> {_safe_int(user_data.get('successful_calls', 0)) or 0}\n"
+        f"❌ <b>ব্যর্থ কল:</b> {_safe_int(user_data.get('failed_calls', 0)) or 0}\n"
+        f"👥 <b>রেফারেল:</b> {_safe_int(user_data.get('referrals', 0)) or 0}\n"
+        f"💠 <b>সর্বোচ্চ কেনাকাটার স্তর:</b> {html.escape(clean_text(user_data.get('subscription_paid_tier', 'NONE'), 30).upper())}\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
@@ -925,27 +943,159 @@ def referral_keyboard(referral_link: str):
 
 
 def main_keyboard(user_id: int):
+    """A message-attached inline dashboard, not a persistent reply keyboard.
+
+    Reply keyboards can keep the phone's text-entry UI open and obscure Android
+    navigation. Inline buttons keep the dashboard usable without replacing the
+    user's normal input/navigation controls.
+    """
     rows = [
-        [KeyboardButton("📞 Send Call", style="success"), KeyboardButton("👤 My Profile", style="primary")],
-        [KeyboardButton("👥 Refer", style="primary"), KeyboardButton("📊 LP Statistics", style="primary")],
-        [KeyboardButton("💰 Buy Credits", style="success"), KeyboardButton("🎁 Redeem", style="danger")],
-        [KeyboardButton("🕘 Call History", style="primary"), KeyboardButton("☎️ Support", style="danger")],
+        [InlineKeyboardButton("📞 Send Call", callback_data="menu:call", style="success"), InlineKeyboardButton("👤 My Profile", callback_data="menu:profile", style="primary")],
+        [InlineKeyboardButton("👥 Refer", callback_data="menu:refer", style="primary"), InlineKeyboardButton("📊 LP Statistics", callback_data="menu:stats", style="primary")],
+        [InlineKeyboardButton("💰 Buy Credits", callback_data="menu:buy", style="success"), InlineKeyboardButton("🎁 Redeem", callback_data="menu:redeem", style="danger")],
+        [InlineKeyboardButton("🕘 Call History", callback_data="menu:history", style="primary"), InlineKeyboardButton("☎️ Support", callback_data="menu:support", style="danger")],
     ]
     settings = get_settings()
     if settings.get("daily_bonus_enabled", False):
-        rows.append([KeyboardButton("🎁 Daily Bonus", style="success")])
+        rows.append([InlineKeyboardButton("🎁 Daily Bonus", callback_data="daily:claim", style="success")])
     if is_admin(user_id):
-        rows.append([KeyboardButton("🛠 Admin Panel", style="danger")])
-    return ReplyKeyboardMarkup(
-        rows,
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Choose an option",
-    )
+        rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin:menu", style="danger")])
+    return InlineKeyboardMarkup(rows)
 
 def back_button():
     # Keep navigation in the standard Telegram chat keyboard; do not add a fake exit/back button.
     return None
+
+
+def interaction_message(update: Update):
+    """Return a message usable from both callback-button and typed-text flows."""
+    if update.callback_query and update.callback_query.message:
+        return update.callback_query.message
+    return update.effective_message
+
+
+def create_audio_proxy_url(user_id: int, file_id: str, extension: str,
+                           content_type: str, file_size: int = 0,
+                           lifetime_minutes: int = 45) -> str:
+    extension = (extension or "ogg").lower()
+    if extension not in {"mp3", "wav", "ogg"}:
+        raise ValueError("সমর্থিত অডিও ফরম্যাট: MP3, WAV, OGG")
+    if not PUBLIC_BASE_URL or not re.match(r"^https://", PUBLIC_BASE_URL, re.I):
+        raise ValueError("Render-এর HTTPS PUBLIC_BASE_URL সেট করা নেই")
+    token = secrets.token_urlsafe(32)
+    db.collection(COL_PROVIDER_AUDIO).document(token).set({
+        "token": token,
+        "file_id": clean_text(file_id, 500),
+        "user_id": int(user_id),
+        "extension": extension,
+        "content_type": clean_text(content_type, 100),
+        "file_size": _safe_int(file_size) or 0,
+        "created_at": now(),
+        "expires_at": now() + timedelta(minutes=max(5, min(60, int(lifetime_minutes)))),
+        "fetches": 0,
+    })
+    return f"{PUBLIC_BASE_URL}/provider-audio/{token}/audio.{extension}"
+
+
+def voice_templates_for_user(user_id: int) -> list:
+    try:
+        records = list(db.collection(COL_VOICE_TEMPLATES).stream())
+    except Exception:
+        return []
+    result = []
+    for record in records:
+        item = record.to_dict() or {}
+        scope = str(item.get("scope", "personal")).lower()
+        owner_id = _safe_int(item.get("owner_id"))
+        if not item.get("active", True):
+            continue
+        if scope == "global" or (scope == "personal" and owner_id == int(user_id)):
+            item["_record_id"] = record.id
+            result.append(item)
+    result.sort(key=lambda item: (0 if item.get("scope") == "global" else 1, str(item.get("title", "")).lower()))
+    return result
+
+
+def voice_templates_keyboard(user_id: int, admin_view: bool = False):
+    templates = voice_templates_for_user(user_id)
+    rows = []
+    for item in templates[:25]:
+        title = clean_text(item.get("title", "ভয়েস টেমপ্লেট"), 42)
+        scope_label = "🌐" if item.get("scope") == "global" else "👤"
+        record_id = clean_text(item.get("_record_id", ""), 80)
+        if admin_view:
+            if item.get("scope") == "global":
+                rows.append([InlineKeyboardButton(f"🗑 {title[:30]}", callback_data=f"admin:template_delete:{record_id}", style="danger")])
+        else:
+            rows.append([InlineKeyboardButton(f"{scope_label} {title}", callback_data=f"template:use:{record_id}", style="success" if item.get("scope") == "global" else "primary")])
+    if admin_view:
+        rows.insert(0, [InlineKeyboardButton("➕ বৈশ্বিক টেমপ্লেট তৈরি", callback_data="admin:template_create_global", style="success")])
+        rows.append([InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin:menu", style="primary")])
+    else:
+        rows.append([InlineKeyboardButton("➕ আমার ব্যক্তিগত টেমপ্লেট তৈরি", callback_data="template:create_personal", style="success")])
+        rows.append([InlineKeyboardButton("❌ বাতিল", callback_data="call:cancel", style="danger")])
+    return templates, InlineKeyboardMarkup(rows)
+
+
+async def show_voice_templates(target, context: ContextTypes.DEFAULT_TYPE, admin_view: bool = False):
+    user_id = target.from_user.id if hasattr(target, "from_user") else target.effective_user.id
+    templates, markup = await asyncio.to_thread(voice_templates_keyboard, user_id, admin_view)
+    if not templates:
+        text = "🎙️ এখনো কোনো ভয়েস টেমপ্লেট নেই। নিচের বাটন দিয়ে নতুন টেমপ্লেট তৈরি করুন।"
+    else:
+        lines = ["🎙️ ভয়েস টেমপ্লেট", "━━━━━━━━━━━━━━━━━━"]
+        for item in templates[:25]:
+            label = "সবার জন্য" if item.get("scope") == "global" else "শুধু আপনার জন্য"
+            lines.append(f"• {clean_text(item.get('title', 'ভয়েস টেমপ্লেট'), 60)} — {label}")
+        text = "\n".join(lines)
+    if hasattr(target, "edit_message_text"):
+        await edit_or_send(target, text, markup, parse_mode=None)
+    elif hasattr(target, "effective_message"):
+        await target.effective_message.reply_text(text, reply_markup=markup)
+    else:
+        await target.reply_text(text, reply_markup=markup)
+
+
+async def save_voice_template_title(update: Update, context: ContextTypes.DEFAULT_TYPE, title: str):
+    state = context.user_data.get("state")
+    pending = context.user_data.get("pending_voice_template") or {}
+    if state not in {"voice_template_title_global", "voice_template_title_personal"} or not pending.get("file_id"):
+        return False
+    title = clean_text(title, 60)
+    if len(title) < 2:
+        await update.effective_message.reply_text("টেমপ্লেটের নাম কমপক্ষে ২ অক্ষরের দিন।")
+        return True
+    global_template = state == "voice_template_title_global"
+    if global_template and not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("এই টেমপ্লেট তৈরি করার অনুমতি নেই।")
+        context.user_data.clear()
+        return True
+    reference = db.collection(COL_VOICE_TEMPLATES).document()
+    reference.set({
+        "title": title,
+        "scope": "global" if global_template else "personal",
+        "owner_id": 0 if global_template else update.effective_user.id,
+        "created_by": update.effective_user.id,
+        "file_id": clean_text(pending.get("file_id"), 500),
+        "extension": clean_text(pending.get("extension", "ogg"), 10),
+        "content_type": clean_text(pending.get("content_type", "audio/ogg"), 100),
+        "file_size": _safe_int(pending.get("file_size")) or 0,
+        "active": True,
+        "created_at": now(),
+        "updated_at": now(),
+    })
+    audit("voice_template_created", update.effective_user.id, {"template_id": reference.id, "title": title, "scope": "global" if global_template else "personal"})
+    context.user_data.pop("pending_voice_template", None)
+    context.user_data["state"] = "call_mode" if context.user_data.get("call_phone") else None
+    await update.effective_message.reply_text(
+        f"✅ ভয়েস টেমপ্লেট তৈরি হয়েছে: {title}\n" + ("এটি সব ব্যবহারকারী ব্যবহার করতে পারবেন।" if global_template else "এটি শুধু আপনার অ্যাকাউন্টে দেখা যাবে।")
+    )
+    if global_template:
+        await update.effective_message.reply_text("🛠 Admin Voice Templates", reply_markup=admin_keyboard_markup())
+    else:
+        templates, markup = await asyncio.to_thread(voice_templates_keyboard, update.effective_user.id, False)
+        await update.effective_message.reply_text("আপনার টেমপ্লেট থেকে একটি নির্বাচন করুন:", reply_markup=markup)
+    return True
 
 
 async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -962,27 +1112,39 @@ async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     existing = get_user(tg_user.id)
     is_new_user = not bool(existing)
+    prior_membership = membership_history(tg_user.id)
     status = await channel_membership_status(context.bot, tg_user.id)
     if status is None:
         await show_join_gate(message, context, verification_error=True)
         return
 
+    if is_new_user and referrer_id and referrer_id != tg_user.id and status is False:
+        # Keep the referral through the join gate. Telegram member events can arrive
+        # before the user's verification button, so store the eligibility decision now.
+        context.user_data["pending_referrer_id"] = referrer_id
+        context.user_data["pending_referral_eligible"] = not bool(prior_membership.get("ever_member", False))
+
+    if not status:
+        # Do not create a new user record until the required channel join is verified.
+        # This lets the successful verification path send the actual welcome message.
+        await show_join_gate(message, context)
+        return
+
     if not existing:
         history = membership_history(tg_user.id)
-        had_membership_before = bool(history.get("ever_member", False))
-        referral_eligible = bool(referrer_id and status is False and not had_membership_before and referrer_id != tg_user.id)
+        # A direct /start from an already-joined member is not a new channel join.
+        referral_eligible = bool(
+            referrer_id and status is False and not prior_membership.get("ever_member", False)
+            and referrer_id != tg_user.id
+        )
         ensure_user(tg_user, referrer_id=referrer_id, referral_eligible=referral_eligible)
     else:
         ensure_user(tg_user)
 
     data = get_user(tg_user.id)
     if data.get("is_blocked") and not is_admin(tg_user.id):
-        await message.reply_text("⛔ Your account is blocked. Support-er sathe contact koro.")
+        await message.reply_text("⛔ আপনার অ্যাকাউন্ট বন্ধ করা হয়েছে। সহায়তার জন্য Support-এ যোগাযোগ করুন।")
         return
-    if not status:
-        await show_join_gate(message, context)
-        return
-
     await complete_pending_referral(tg_user.id)
     settings = get_settings()
     notice = settings.get("admin_notice", "")
@@ -991,10 +1153,10 @@ async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💳 Balance: *{format_balance(data.get('balance', 0))} credits*\n"
         f"📞 Total Calls: *{_safe_int(data.get('total_calls', 0)) or 0}*\n"
         f"👥 Referrals: *{_safe_int(data.get('referrals', 0)) or 0}*\n\n"
-        "Nicher menu theke feature select koro."
+        "নিচের মেনু থেকে একটি সুবিধা নির্বাচন করুন।"
     )
     if settings.get("maintenance") and not is_admin(tg_user.id):
-        text += "\n\n🛠 Service maintenance-e ache."
+        text += "\n\n🛠 সেবা রক্ষণাবেক্ষণে আছে।"
     if notice:
         text += f"\n\nℹ️ {escape_markdown(clean_text(notice, 500), version=1)}"
     if is_new_user:
@@ -1014,7 +1176,14 @@ def strip_markdown_for_fallback(text: str) -> str:
 
 
 async def edit_or_send(query, text: str, markup=None, parse_mode="Markdown"):
-    # Reply keyboards belong to a new chat message; Telegram rejects them in editMessageText.
+    # All bot navigation uses message-attached inline buttons. This avoids a persistent
+    # reply keyboard that can interfere with Android's normal input/navigation controls.
+    if markup is None and getattr(query, "from_user", None):
+        try:
+            markup = main_keyboard(query.from_user.id)
+        except Exception:
+            markup = None
+    # Legacy reply keyboards, if any, must be sent as a new message.
     if isinstance(markup, ReplyKeyboardMarkup):
         try:
             await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=markup)
@@ -1047,10 +1216,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "membership:check":
         status = await channel_membership_status(context.bot, user_id, force=True)
         if status is True:
-            if not get_user(user_id):
-                ensure_user(query.from_user)
+            is_new_user = not bool(get_user(user_id))
+            if is_new_user:
+                pending_referrer = _safe_int(context.user_data.get("pending_referrer_id"))
+                pending_eligible = bool(context.user_data.get("pending_referral_eligible"))
+                ensure_user(
+                    query.from_user,
+                    referrer_id=pending_referrer if pending_eligible else None,
+                    referral_eligible=pending_eligible and bool(pending_referrer),
+                )
             await complete_pending_referral(user_id)
-            await edit_or_send(query, "✅ Channel verification successful. Feature unlock hoye geche.", main_keyboard(user_id))
+            context.user_data.pop("pending_referrer_id", None)
+            context.user_data.pop("pending_referral_eligible", None)
+            if is_new_user:
+                new_user_data = get_user(user_id)
+                welcome = (
+                    f"🎉 স্বাগতম, {clean_text(query.from_user.first_name or 'বন্ধু', 80)}!\n\n"
+                    "Custom Call Bot-এ আপনাকে স্বাগতম। আপনার অ্যাকাউন্ট তৈরি হয়েছে। নিয়ম অনুযায়ী স্বাগতম ক্রেডিট যোগ করা হয়েছে।\n\n"
+                    f"💳 আপনার ব্যালেন্স: {format_balance(new_user_data.get('balance', 0))} ক্রেডিট\n"
+                    "নিচের মেনু থেকে একটি সুবিধা নির্বাচন করুন।"
+                )
+                await edit_or_send(query, welcome, main_keyboard(user_id), parse_mode=None)
+            else:
+                await edit_or_send(query, "✅ চ্যানেল যাচাই সম্পন্ন। বটের সুবিধাগুলো এখন ব্যবহার করতে পারবেন।", main_keyboard(user_id), parse_mode=None)
         elif status is False:
             await show_join_gate(query, context)
         else:
@@ -1069,26 +1257,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ensure_user(query.from_user)
     if user_blocked(user_id) and not is_admin(user_id):
-        await edit_or_send(query, "⛔ Your account is blocked. Support-er sathe contact koro.", None)
+        await edit_or_send(query, "⛔ আপনার অ্যাকাউন্ট বন্ধ করা হয়েছে। সহায়তার জন্য Support-এ যোগাযোগ করুন।", None, parse_mode=None)
         return
 
     if data in {"menu:home", "menu:back"}:
         context.user_data.clear()
         u = get_user(user_id)
-        await edit_or_send(query, f"🏠 *Dashboard*\n\nBalance: *{format_balance(u.get('balance', 0))} credits*\nMenu theke option select koro.", main_keyboard(user_id))
+        await edit_or_send(query, f"🏠 *ড্যাশবোর্ড*\n\nব্যালেন্স: *{format_balance(u.get('balance', 0))} ক্রেডিট*\nনিচের মেনু থেকে একটি সুবিধা নির্বাচন করুন।", main_keyboard(user_id))
         return
 
     if data == "menu:profile":
         u = get_user(user_id)
         text = profile_message(user_id, u)
-        await edit_or_send(query, text, back_button(), parse_mode=None)
+        await edit_or_send(query, text, back_button(), parse_mode="HTML")
         return
 
     if data == "menu:refer":
         me = await context.bot.get_me()
         referral_link = f"https://t.me/{me.username}?start=ref_{user_id}"
         bonus = credits_float(get_settings().get("referral_bonus", 1))
-        text = ("👥 *Refer Friends*\n\n" f"Referral Bonus: *{bonus:g} Credit(s)*\n" f"Link share koro ar *{bonus:g} credit jite nao!*\n\n" f"Your Link:\n`{escape_markdown(referral_link, version=1)}`\n\n" "Bonus pabe shudhu eligible new user-er jonno. Je user age required channel member chilo, tar referral count hobe na.")
+        text = ("👥 *বন্ধুদের আমন্ত্রণ করুন*\n\n" f"রেফারেল বোনাস: *{bonus:g} ক্রেডিট*\n" f"লিংক শেয়ার করুন এবং *{bonus:g} ক্রেডিট জিতে নিন!*\n\n" f"আপনার লিংক:\n`{escape_markdown(referral_link, version=1)}`\n\n" "বোনাস শুধু যোগ্য নতুন ব্যবহারকারীর জন্য। যে ব্যক্তি আগে থেকেই প্রয়োজনীয় চ্যানেলের সদস্য ছিলেন, তার জন্য রেফারেল বোনাস দেওয়া হবে না।")
         await edit_or_send(query, text, referral_keyboard(referral_link))
         return
 
@@ -1118,7 +1306,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         docs = list(db.collection(COL_CALLS).where("user_id", "==", user_id).limit(50).stream())
         items = sorted(docs, key=lambda snap: str((snap.to_dict() or {}).get("created_at") or ""), reverse=True)[:10]
         if not items:
-            await edit_or_send(query, "📞 *Call History*\n\nKono call history nei.", back_button())
+            await edit_or_send(query, "📞 *কলের ইতিহাস*\n\nএখনো কোনো কলের ইতিহাস নেই।", back_button())
             return
         lines = ["📞 *Recent Calls*\n"]
         for snap in items:
@@ -1135,7 +1323,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu:support":
         support_url = clean_text(get_settings().get("support_contact_url") or SUPPORT_CONTACT_URL, 300)
-        support_text = clean_text(get_settings().get("support_text", "Support er jonno admin-ke message koro."), 1800)
+        support_text = clean_text(get_settings().get("support_text", "সহায়তার জন্য নিচের বাটনে চাপ দিন।"), 1800)
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("✉️ Message Support Admin", url=support_url, style="primary")],
         ])
@@ -1153,47 +1341,100 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu:redeem":
         context.user_data.clear()
         context.user_data["state"] = "redeem_code"
-        await edit_or_send(query, "🎁 *Redeem Code*\n\nYour redeem code pathao.", back_button())
+        await edit_or_send(query, "🎁 *রিডিম কোড*\n\nআপনার রিডিম কোডটি পাঠান।", back_button())
         return
     if data == "menu:call":
         call_settings = get_settings()
         if call_settings.get("maintenance", False):
-            await edit_or_send(query, "🛠 Call maintenance ON ache. Ekhon call temporarily disabled; other features cholbe.", back_button())
+            await edit_or_send(query, "🛠 কল সার্ভিস রক্ষণাবেক্ষণে আছে। আপাতত শুধু কল বন্ধ; অন্য সুবিধাগুলো চালু আছে।", back_button(), parse_mode=None)
             return
         u = get_user(user_id)
         cost = credits_float(call_settings.get("call_credit_cost", 1))
         if credits_float(u.get("balance", 0)) <= 0 or credits_float(u.get("balance", 0)) < cost:
-            await edit_or_send(query, f"❌ Call dite credit lagbe. Required: *{cost:g} credits*. Buy Credits ba Redeem use koro.", back_button())
+            await edit_or_send(query, f"❌ কল দিতে কমপক্ষে *{cost:g} ক্রেডিট* প্রয়োজন। Buy Credits অথবা Redeem ব্যবহার করুন।", back_button())
             return
         context.user_data.clear()
         context.user_data["state"] = "call_phone"
-        await edit_or_send(query, "📞 *Send Call*\n\nDestination phone number pathao. Example: `01700000000`", back_button())
+        await edit_or_send(query, "📞 *কল করুন*\n\nযে নম্বরে কল দিতে চান সেটি পাঠান। উদাহরণ: `01700000000`", back_button())
         return
     if data.startswith("callmode:"):
         mode = data.split(":", 1)[1]
+        context.user_data.pop("call_text", None)
+        context.user_data.pop("call_audio_url", None)
+        context.user_data.pop("call_template_id", None)
+        context.user_data.pop("call_template_title", None)
         context.user_data["call_mode"] = mode
-        if mode == "text":
+        if mode == "templates":
+            await show_voice_templates(query, context, admin_view=False)
+        elif mode == "text":
             context.user_data["state"] = "call_content_text"
-            await edit_or_send(query, "📝 Call-e je text bola hobe seta pathao.", back_button())
+            await edit_or_send(query, "📝 কলে যে কথা বলা হবে, সেই টেক্সট পাঠান।", back_button(), parse_mode=None)
         elif mode == "audio_url":
             context.user_data["state"] = "call_content_audio_url"
-            await edit_or_send(query, "🔗 Direct MP3/WAV/OGG URL pathao.", back_button())
+            await edit_or_send(query, "🔗 সরাসরি MP3/WAV/OGG অডিও লিংক পাঠান।", back_button(), parse_mode=None)
         else:
             context.user_data["state"] = "call_content_audio_upload"
-            await edit_or_send(query, "🎧 MP3/WAV/OGG/Voice file upload koro.", back_button())
+            await edit_or_send(query, "🎧 MP3/WAV/OGG ফাইল অথবা ভয়েস মেসেজ পাঠান।", back_button(), parse_mode=None)
+        return
+    if data == "template:create_personal":
+        context.user_data["state"] = "voice_template_upload_personal"
+        await edit_or_send(query, "🎙️ আপনার ব্যক্তিগত টেমপ্লেট তৈরি করতে MP3/WAV/OGG ফাইল বা ভয়েস মেসেজ পাঠান। এটি শুধু আপনার জন্য থাকবে।", None, parse_mode=None)
+        return
+    if data.startswith("template:use:"):
+        template_id = data.split(":", 2)[2]
+        template_ref = db.collection(COL_VOICE_TEMPLATES).document(template_id)
+        template_snap = await asyncio.to_thread(template_ref.get)
+        template = template_snap.to_dict() if template_snap.exists else {}
+        if not template or not template.get("active", True):
+            await edit_or_send(query, "এই ভয়েস টেমপ্লেটটি পাওয়া যায়নি বা নিষ্ক্রিয়।", None, parse_mode=None)
+            return
+        scope = str(template.get("scope", "personal")).lower()
+        if scope != "global" and _safe_int(template.get("owner_id")) != user_id:
+            await edit_or_send(query, "এই টেমপ্লেটটি আপনার জন্য নয়।", None, parse_mode=None)
+            return
+        if not context.user_data.get("call_phone"):
+            await edit_or_send(query, "প্রথমে Send Call চাপুন এবং ফোন নম্বর দিন।", main_keyboard(user_id), parse_mode=None)
+            return
+        try:
+            ext = clean_text(template.get("extension", "ogg"), 10).lower()
+            audio_url = await asyncio.to_thread(
+                create_audio_proxy_url,
+                user_id,
+                template.get("file_id"),
+                ext,
+                template.get("content_type", "audio/ogg"),
+                _safe_int(template.get("file_size")) or 0,
+            )
+        except Exception as exc:
+            await edit_or_send(query, f"❌ টেমপ্লেট প্রস্তুত করা যায়নি: {clean_text(exc, 300)}", None, parse_mode=None)
+            return
+        context.user_data["call_audio_url"] = audio_url
+        context.user_data["call_text"] = None
+        context.user_data["call_template_id"] = template_id
+        context.user_data["call_template_title"] = clean_text(template.get("title", "Voice Template"), 100)
+        context.user_data["call_mode"] = "template"
+        await edit_or_send(query, f"✅ টেমপ্লেট নির্বাচিত: {clean_text(template.get('title', 'Voice Template'), 80)}\nএখন কলের সময় নির্বাচন করুন।", None, parse_mode=None)
+        await ask_call_time(update)
         return
     if data.startswith("calltime:"):
+        if data == "calltime:custom":
+            context.user_data["state"] = "call_custom_duration"
+            await edit_or_send(query, "⏱️ কাস্টম সময় লিখুন (১০–৩০০ সেকেন্ড)। শুধু সংখ্যা লিখবেন, যেমন: 45", None, parse_mode=None)
+            return
         try:
             seconds = int(data.split(":", 1)[1])
         except (TypeError, ValueError):
-            await edit_or_send(query, "Invalid call duration. abar try koro.", back_button())
+            await edit_or_send(query, "কলের সময় সঠিক নয়। আবার নির্বাচন করুন।", back_button(), parse_mode=None)
+            return
+        if seconds < 10 or seconds > 300:
+            await edit_or_send(query, "কলের সময় ১০ থেকে ৩০০ সেকেন্ডের মধ্যে হতে হবে।", back_button(), parse_mode=None)
             return
         context.user_data["call_time"] = seconds
         await execute_pending_call(update, context)
         return
     if data == "call:cancel":
         context.user_data.clear()
-        await edit_or_send(query, "Cancelled.", main_keyboard(user_id))
+        await edit_or_send(query, "অনুরোধ বাতিল করা হয়েছে।", main_keyboard(user_id))
         return
     if data == "daily:claim":
         await claim_daily(query)
@@ -1223,9 +1464,9 @@ async def show_buy(query, context):
         "💰 *Credit Purchase*\n━━━━━━━━━━━━━━━━━\n\n"
         "📦 *Available Packages:*\n\n" + package_lines +
         "\n━━━━━━━━━━━━━━━━━\n"
-        f"💳 bKash: `{bkash}`\n💳 Nagad: `{nagad}`\n"
-        "⚡ Admin approve korle credits auto add hobe.\n\n"
-        "👇 Nicher package select koro:"
+        f"💳 bKash: *{bkash}*\n💳 Nagad: *{nagad}*\n"
+        "⚡ অ্যাডমিন অনুমোদন দিলে ক্রেডিট স্বয়ংক্রিয়ভাবে যোগ হবে।\n\n"
+        "👇 নিচের প্যাকেজ নির্বাচন করুন।"
     )
     await edit_or_send(query, text, InlineKeyboardMarkup(rows))
 
@@ -1253,7 +1494,7 @@ async def select_package(query, context, pkg_id: str):
     settings = get_settings()
     package = next((p for p in settings.get("packages", []) if p.get("id") == pkg_id), None)
     if not package:
-        await edit_or_send(query, "Package not found.", back_button())
+        await edit_or_send(query, "প্যাকেজটি পাওয়া যায়নি।", back_button())
         return
     context.user_data["payment_package"] = package
     methods = []
@@ -1263,29 +1504,36 @@ async def select_package(query, context, pkg_id: str):
         methods.append([InlineKeyboardButton("🧡 Pay with Nagad", callback_data="paymethod:nagad", style="primary")])
     methods.append([InlineKeyboardButton("⬅️ Cancel", callback_data="menu:buy")])
     if len(methods) == 1:
-        await edit_or_send(query, "❌ Admin ekhono kono payment number set koreni.", back_button())
+        await edit_or_send(query, "❌ অ্যাডমিন এখনো কোনো পেমেন্ট নম্বর সেট করেননি।", back_button())
         return
-    await edit_or_send(query, f"📦 *{clean_text(package.get('label'),100)}*\nCredits: *{credits_float(package.get('credits', 0)):g}*\nPrice: *{int(package.get('price',0))} TK*\n\nPayment method select koro:", InlineKeyboardMarkup(methods))
+    await edit_or_send(
+        query,
+        f"📦 *{clean_text(package.get('label'),100)}*\n"
+        f"ক্রেডিট: *{credits_float(package.get('credits', 0)):g}*\n"
+        f"মূল্য: *{int(package.get('price', 0))} TK*\n\n"
+        "পেমেন্টের মাধ্যম নির্বাচন করুন:",
+        InlineKeyboardMarkup(methods),
+    )
 
 
 async def select_payment_method(query, context, method: str):
     package = context.user_data.get("payment_package")
     if not package:
-        await edit_or_send(query, "Package session expired. Buy Credits abar open koro.", back_button())
+        await edit_or_send(query, "প্যাকেজের সেশন শেষ হয়েছে। Buy Credits আবার খুলুন।", back_button())
         return
     key = "bkash_number" if method == "bkash" else "nagad_number" if method == "nagad" else None
     if not key:
-        await edit_or_send(query, "Invalid payment method.", back_button())
+        await edit_or_send(query, "পেমেন্টের মাধ্যম সঠিক নয়।", back_button())
         return
     settings = get_settings()
     number = clean_text(settings.get(key), 40)
     if not number:
-        await edit_or_send(query, f"{method.title()} payment currently unavailable. onno method try koro.", back_button())
+        await edit_or_send(query, f"{method.title()} পেমেন্ট আপাতত বন্ধ। অন্য মাধ্যম ব্যবহার করুন।", back_button())
         return
     context.user_data["payment_method"] = method
     context.user_data["payment_number"] = number
     context.user_data["state"] = "payment_txn"
-    await edit_or_send(query, f"💳 *{method.title()} Payment*\n\nSend money to: `{number}`\nPackage: *{clean_text(package.get('label'),100)}*\nAmount: *{int(package.get('price',0))} TK*\n\nPayment complete kore Transaction ID pathao. Same Transaction ID second time accept hobe na.", back_button())
+    await edit_or_send(query, f"💳 *{method.title()} পেমেন্ট*\n\nটাকা পাঠান: *{number}*\nপ্যাকেজ: *{clean_text(package.get('label'),100)}*\nমূল্য: *{int(package.get('price',0))} TK*\n\nপেমেন্ট সম্পন্ন করে Transaction ID পাঠান। একই Transaction ID দ্বিতীয়বার গ্রহণ করা হবে না।", back_button())
 
 async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str):
     user = update.effective_user
@@ -1298,20 +1546,20 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
 
     if label == "📞 Send Call":
         if settings.get("maintenance", False):
-            await message.reply_text("🛠 Call maintenance ON ache. Ekhon call temporarily disabled; onno feature cholbe.", reply_markup=keyboard)
+            await message.reply_text("🛠 কল সার্ভিস রক্ষণাবেক্ষণে আছে। আপাতত কল বন্ধ, অন্য সুবিধাগুলো চালু আছে।", reply_markup=keyboard)
             return
         balance = credits_float(get_user(user_id).get("balance", 0))
         cost = credits_float(settings.get("call_credit_cost", 1))
         if balance <= 0 or balance < cost:
-            await message.reply_text(f"❌ Call dite credit lagbe. Required: {cost:g}; current balance: {balance:g}. Buy Credits ba Redeem use koro.", reply_markup=keyboard)
+            await message.reply_text(f"❌ কল দিতে ক্রেডিট প্রয়োজন। প্রয়োজন: {cost:g}; বর্তমান ব্যালেন্স: {balance:g}। Buy Credits অথবা Redeem ব্যবহার করুন।", reply_markup=keyboard)
             return
         context.user_data["state"] = "call_phone"
-        await message.reply_text("📞 Send Call\nDestination phone number pathao. Example: 01700000000", reply_markup=keyboard)
+        await message.reply_text("📞 কল করুন\nযে নম্বরে কল দিতে চান সেটি পাঠান। উদাহরণ: 01700000000", reply_markup=keyboard)
         return
 
     if label == "👤 My Profile":
         data = get_user(user_id)
-        await message.reply_text(profile_message(user_id, data), reply_markup=keyboard, parse_mode=None)
+        await message.reply_text(profile_message(user_id, data), reply_markup=keyboard, parse_mode="HTML")
         return
 
     if label == "👥 Refer":
@@ -1319,11 +1567,11 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
         referral_link = f"https://t.me/{me.username}?start=ref_{user_id}"
         bonus = credits_float(settings.get("referral_bonus", 1))
         await message.reply_text(
-            "👥 REFERRAL PROGRAM\n━━━━━━━━━━━━━━━━━\n"
-            f"Referral Bonus: {bonus:g} Credit(s)\n"
-            f"Link share koro ar {bonus:g} credit jite nao!\n\n"
-            f"Your referral link:\n{referral_link}\n\n"
-            "Bonus pabe only eligible new users-er jonno. Je user age required channel member chilo, tar referral count hobe na.",
+            "👥 রেফারেল প্রোগ্রাম\n━━━━━━━━━━━━━━━━━\n"
+            f"রেফারেল বোনাস: {bonus:g} ক্রেডিট\n"
+            f"লিংক শেয়ার করুন এবং {bonus:g} ক্রেডিট জিতে নিন!\n\n"
+            f"আপনার রেফারেল লিংক:\n{referral_link}\n\n"
+            "বোনাস শুধু যোগ্য নতুন ব্যবহারকারীর জন্য। আগে থেকেই প্রয়োজনীয় চ্যানেলের সদস্য হলে বোনাস পাওয়া যাবে না।",
             reply_markup=referral_keyboard(referral_link),
         )
         return
@@ -1351,27 +1599,27 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
         packages = settings.get("packages", [])
         rows = [[InlineKeyboardButton(clean_text(pkg.get("label", f"{pkg.get('credits')} Calls"), 60), callback_data=f"buy:{pkg.get('id')}", style="success" if i % 2 == 0 else "primary")] for i, pkg in enumerate(packages)]
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:home", style="primary")])
-        package_lines = "\n".join(f"• {clean_text(pkg.get('label'), 100)}" for pkg in packages)
+        package_lines = "\n".join(f"• {html.escape(clean_text(pkg.get('label'), 100))}" for pkg in packages)
         text = (
-            "💰 Credit Purchase\n━━━━━━━━━━━━━━━━━\n\n"
-            "📦 Available Packages:\n\n" + package_lines + "\n━━━━━━━━━━━━━━━━━\n"
-            f"💳 bKash: {clean_text(settings.get('bkash_number') or 'Not set', 40)}\n"
-            f"💳 Nagad: {clean_text(settings.get('nagad_number') or 'Not set', 40)}\n"
-            "⚡ Admin approve korle credits auto add hobe.\n\n👇 Nicher package select koro:"
+            "💰 <b>ক্রেডিট কিনুন</b>\n━━━━━━━━━━━━━━━━━\n\n"
+            "📦 <b>উপলভ্য প্যাকেজ:</b>\n\n" + package_lines + "\n━━━━━━━━━━━━━━━━━\n"
+            f"💳 বিকাশ: <b>{html.escape(clean_text(settings.get('bkash_number') or 'সেট করা নেই', 40))}</b>\n"
+            f"💳 নগদ: <b>{html.escape(clean_text(settings.get('nagad_number') or 'সেট করা নেই', 40))}</b>\n"
+            "⚡ অ্যাডমিন অনুমোদন দিলে ক্রেডিট স্বয়ংক্রিয়ভাবে যোগ হবে।\n\n👇 নিচের প্যাকেজ নির্বাচন করুন:"
         )
-        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        await message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if label == "🎁 Redeem":
         context.user_data["state"] = "redeem_code"
-        await message.reply_text("🎁 Redeem Code\nTomar redeem code pathao.", reply_markup=keyboard)
+        await message.reply_text("🎁 রিডিম কোড\nআপনার রিডিম কোডটি পাঠান।", reply_markup=keyboard)
         return
 
     if label == "🕘 Call History":
         docs = list(db.collection(COL_CALLS).where("user_id", "==", user_id).limit(50).stream())
         docs.sort(key=lambda snap: str((snap.to_dict() or {}).get("created_at") or ""), reverse=True)
         if not docs:
-            await message.reply_text("📞 Call History\nKono call history nei.", reply_markup=keyboard)
+            await message.reply_text("📞 কলের ইতিহাস\nএখনো কোনো কলের ইতিহাস নেই।", reply_markup=keyboard)
             return
         lines = ["📞 Recent Calls"]
         for snap in docs[:10]:
@@ -1383,15 +1631,15 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
 
     if label == "☎️ Support":
         support_url = clean_text(settings.get("support_contact_url") or SUPPORT_CONTACT_URL, 300)
-        support_text = clean_text(settings.get("support_text", "Support er jonno admin-ke message koro."), 1800)
+        support_text = clean_text(settings.get("support_text", "সহায়তার জন্য নিচের বাটনে চাপ দিন।"), 1800)
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("✉️ Message Support Admin", url=support_url, style="primary")]])
-        await message.reply_text(f"☎️ Support\n{support_text}\nAdmin ID: {ADMIN_ID}", reply_markup=markup)
+        await message.reply_text(f"☎️ সহায়তা\n{support_text}\nঅ্যাডমিন আইডি: {ADMIN_ID}", reply_markup=markup)
         return
 
     if label == "🎁 Daily Bonus":
         try:
             after = claim_daily_credit(user_id)
-            await message.reply_text(f"🎁 Daily bonus claimed: +{credits_float(settings.get('daily_bonus', 0)):g} credits. New balance: {after:g}", reply_markup=main_keyboard(user_id))
+            await message.reply_text(f"🎁 দৈনিক বোনাস পেয়েছেন: +{credits_float(settings.get('daily_bonus', 0)):g} ক্রেডিট। নতুন ব্যালেন্স: {after:g}", reply_markup=main_keyboard(user_id))
         except Exception as exc:
             await message.reply_text(f"ℹ️ {clean_text(exc, 300)}", reply_markup=keyboard)
         return
@@ -1400,7 +1648,7 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
         await message.reply_text("🛠 Admin Panel — choose an operation:", reply_markup=admin_keyboard_markup())
         return
 
-    await message.reply_text("Dashboard theke ekta option select koro.", reply_markup=keyboard)
+    return
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1413,7 +1661,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     ensure_user(update.effective_user)
     if user_blocked(user_id) and not is_admin(user_id):
-        await update.effective_message.reply_text("⛔ Your account is blocked. Support-er sathe contact koro.")
+        await update.effective_message.reply_text("⛔ আপনার অ্যাকাউন্ট বন্ধ করা হয়েছে। সহায়তার জন্য Support-এ যোগাযোগ করুন।")
         return
 
     text = clean_text(update.effective_message.text, 4000)
@@ -1440,63 +1688,84 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         u = get_user(user_id)
         cost = credits_float(get_settings().get("call_credit_cost", 1))
         if credits_float(u.get("balance", 0)) <= 0 or credits_float(u.get("balance", 0)) < cost:
-            await update.effective_message.reply_text(f"❌ Call dite credit lagbe. Required: {cost:g} credits. Buy Credits ba Redeem use koro.")
+            await update.effective_message.reply_text(f"❌ কল দিতে ক্রেডিট প্রয়োজন। প্রয়োজন: {cost:g} ক্রেডিট। Buy Credits অথবা Redeem ব্যবহার করুন।")
             context.user_data.clear()
             return
         phone = normalize_phone(text)
         if not phone:
-            await update.effective_message.reply_text("❌ Invalid phone number. abar try koro.")
+            await update.effective_message.reply_text("❌ ফোন নম্বর সঠিক নয়। আবার চেষ্টা করুন।")
             return
         context.user_data["call_phone"] = phone
         context.user_data["state"] = "call_mode"
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 Text to Speech", callback_data="callmode:text", style="success")],
-            [InlineKeyboardButton("🔗 Audio URL", callback_data="callmode:audio_url", style="primary")],
-            [InlineKeyboardButton("🎧 Upload Audio", callback_data="callmode:audio_upload", style="primary")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="call:cancel", style="danger")],
+            [InlineKeyboardButton("📝 টেক্সট থেকে ভয়েস", callback_data="callmode:text", style="success")],
+            [InlineKeyboardButton("🔗 অডিও লিংক", callback_data="callmode:audio_url", style="primary")],
+            [InlineKeyboardButton("🎧 অডিও আপলোড", callback_data="callmode:audio_upload", style="primary")],
+            [InlineKeyboardButton("🎙️ ভয়েস টেমপ্লেট ব্যবহার", callback_data="callmode:templates", style="success")],
+            [InlineKeyboardButton("❌ বাতিল", callback_data="call:cancel", style="danger")],
         ])
-        await update.effective_message.reply_text(f"📞 Number: `****{phone[-4:]}`\n\nCall audio method select koro.", parse_mode="Markdown", reply_markup=markup)
+        await update.effective_message.reply_text(f"📞 নম্বর: ****{phone[-4:]}\n\nকলের ভয়েস কীভাবে দিতে চান, নির্বাচন করুন।", parse_mode=None, reply_markup=markup)
+        return
+    if state in {"voice_template_title_global", "voice_template_title_personal"}:
+        handled = await save_voice_template_title(update, context, text)
+        if handled:
+            return
+    if state == "call_custom_duration":
+        raw_seconds = re.sub(r"\s*(?:sec|secs|seconds|s|সেকেন্ড)\s*$", "", text, flags=re.I).strip()
+        if not raw_seconds.isdigit():
+            await update.effective_message.reply_text("শুধু সেকেন্ডের সংখ্যা লিখুন, যেমন 45।")
+            return
+        seconds = int(raw_seconds)
+        if seconds < 10 or seconds > 300:
+            await update.effective_message.reply_text("সময় ১০ থেকে ৩০০ সেকেন্ডের মধ্যে দিন।")
+            return
+        context.user_data["call_time"] = seconds
+        await execute_pending_call(update, context)
         return
     if state == "call_content_text":
         if not text:
-            await update.effective_message.reply_text("❌ Text required.")
+            await update.effective_message.reply_text("❌ কলের জন্য বলার টেক্সট প্রয়োজন।")
             return
         context.user_data["call_text"] = text
         await ask_call_time(update)
         return
     if state == "call_content_audio_url":
         if not re.match(r"^https?://", text, re.I):
-            await update.effective_message.reply_text("❌ Valid http/https direct audio URL pathao.")
+            await update.effective_message.reply_text("❌ সঠিক http/https অডিও লিংক পাঠান।")
             return
         if not re.search(r"\.(mp3|wav|ogg)(\?.*)?$", text, re.I):
-            await update.effective_message.reply_text("⚠️ URL-ta direct MP3, WAV, or OGG file hote hobe.")
+            await update.effective_message.reply_text("⚠️ লিংকটি সরাসরি MP3, WAV অথবা OGG ফাইলের হতে হবে।")
             return
         context.user_data["call_audio_url"] = text
         await ask_call_time(update)
         return
     if state == "call_content_audio_upload":
-        await update.effective_message.reply_text("🎧 Send Call → Upload Audio select kore audio/voice file pathao.")
+        await update.effective_message.reply_text("প্রথমে Send Call থেকে অডিও আপলোড নির্বাচন করে অডিও বা ভয়েস ফাইল পাঠান।")
         return
     if state == "admin_broadcast":
         await do_broadcast(update, context, text)
         return
-    # Ignore unrelated text when the user has not selected an action.
+    # কোনো অপশন নির্বাচন না করা থাকলে সাধারণ টেক্সটের উত্তর দেওয়া হবে না।
     return
 
 async def ask_call_time(update: Update):
     markup = InlineKeyboardMarkup([
         [
+            InlineKeyboardButton("10s", callback_data="calltime:10", style="success"),
             InlineKeyboardButton("30s", callback_data="calltime:30", style="primary"),
             InlineKeyboardButton("60s", callback_data="calltime:60", style="primary"),
-            InlineKeyboardButton("120s", callback_data="calltime:120", style="primary"),
         ],
         [
+            InlineKeyboardButton("120s", callback_data="calltime:120", style="primary"),
             InlineKeyboardButton("180s", callback_data="calltime:180", style="primary"),
             InlineKeyboardButton("300s", callback_data="calltime:300", style="primary"),
         ],
-        [InlineKeyboardButton("❌ Cancel", callback_data="call:cancel", style="danger")],
+        [InlineKeyboardButton("✍️ নিজের সময় লিখুন", callback_data="calltime:custom", style="success")],
+        [InlineKeyboardButton("❌ বাতিল", callback_data="call:cancel", style="danger")],
     ])
-    await update.effective_message.reply_text("⏱ Choose call duration.", reply_markup=markup)
+    message = interaction_message(update)
+    if message:
+        await message.reply_text("⏱️ কলের সময় নির্বাচন করুন।", reply_markup=markup)
 
 
 async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1511,8 +1780,10 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if user_blocked(user_id) and not is_admin(user_id):
         await update.effective_message.reply_text("⛔ Your account is blocked.")
         return
-    if context.user_data.get("state") != "call_content_audio_upload":
-        await update.effective_message.reply_text("First select Send Call → Upload Audio, then send an MP3/WAV/OGG or voice message.")
+    current_state = context.user_data.get("state")
+    template_upload_state = current_state in {"voice_template_upload_global", "voice_template_upload_personal"}
+    if current_state != "call_content_audio_upload" and not template_upload_state:
+        await update.effective_message.reply_text("প্রথমে Send Call → অডিও আপলোড নির্বাচন করুন, তারপর MP3/WAV/OGG ফাইল বা ভয়েস মেসেজ পাঠান।")
         return
 
     message = update.effective_message
@@ -1538,48 +1809,46 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
         name = media.file_name or ""
         match = re.search(r"\.(mp3|wav|ogg)$", name, re.I)
         if not match:
-            await message.reply_text("❌ Supported audio types: MP3, WAV, OGG.")
+            await message.reply_text("❌ সমর্থিত অডিও ফরম্যাট: MP3, WAV, OGG।")
             return
         extension = match.group(1).lower()
         content_type = {"mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg"}[extension]
     else:
-        await message.reply_text("❌ Supported audio types: MP3, WAV, OGG or Telegram voice message.")
+        await message.reply_text("❌ MP3, WAV, OGG ফাইল অথবা Telegram voice message পাঠান।")
         return
 
     file_size = _safe_int(getattr(media, "file_size", None))
     max_size = 15 * 1024 * 1024
     if file_size is not None and file_size > max_size:
-        await message.reply_text("❌ Audio file 15 MB-er beshi. Choto MP3/WAV/OGG file pathao.")
+        await message.reply_text("❌ অডিও ফাইল ১৫ MB-এর বেশি। ছোট MP3/WAV/OGG ফাইল পাঠান।")
         return
-    if not PUBLIC_BASE_URL or not re.match(r"^https://", PUBLIC_BASE_URL, re.I):
-        await message.reply_text("❌ Audio proxy-r jonno Render-er HTTPS PUBLIC_BASE_URL set koro (example: https://your-service.onrender.com). Firebase Storage bucket lagbe na.")
-        return
-
-    token = secrets.token_urlsafe(32)
-    expires_at = now() + timedelta(minutes=45)
-    token_ref = db.collection(COL_PROVIDER_AUDIO).document(token)
-    try:
-        token_ref.set({
-            "token": token,
+    if template_upload_state:
+        context.user_data["pending_voice_template"] = {
             "file_id": media.file_id,
-            "user_id": user_id,
             "extension": extension,
             "content_type": content_type,
             "file_size": file_size or 0,
-            "created_at": now(),
-            "expires_at": expires_at,
-            "fetches": 0,
-        })
-        audio_url = f"{PUBLIC_BASE_URL}/provider-audio/{token}/audio.{extension}"
+        }
+        context.user_data["state"] = "voice_template_title_global" if current_state == "voice_template_upload_global" else "voice_template_title_personal"
+        await message.reply_text("✅ অডিও পাওয়া গেছে। এবার টেমপ্লেটের একটি নাম লিখুন (২–৬০ অক্ষর)।")
+        return
+    if not PUBLIC_BASE_URL or not re.match(r"^https://", PUBLIC_BASE_URL, re.I):
+        await message.reply_text("❌ অডিও পাঠানোর জন্য Render-এর HTTPS PUBLIC_BASE_URL সেট করুন (উদাহরণ: https://your-service.onrender.com)। Firebase Storage bucket প্রয়োজন নেই।")
+        return
+
+    try:
+        audio_url = await asyncio.to_thread(
+            create_audio_proxy_url, user_id, media.file_id, extension,
+            content_type, file_size or 0,
+        )
         context.user_data["call_audio_url"] = audio_url
-        await message.reply_text("✅ Audio ready. Firebase Storage use kora hoyni; secure temporary audio link create hoyeche. Ekhon call duration select koro.")
+        context.user_data["call_mode"] = "audio_upload"
+        context.user_data.pop("call_template_id", None)
+        context.user_data.pop("call_template_title", None)
+        await message.reply_text("✅ অডিও প্রস্তুত। এখন কলের সময় নির্বাচন করুন।")
         await ask_call_time(update)
     except Exception as exc:
-        try:
-            token_ref.delete()
-        except Exception:
-            pass
-        await message.reply_text(f"❌ Audio prepare kora jayni: {clean_text(exc, 400)}")
+        await message.reply_text(f"❌ অডিও প্রস্তুত করা যায়নি: {clean_text(exc, 400)}")
 
 
 async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1590,7 +1859,9 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
     lock = USER_CALL_LOCKS.setdefault(uid, asyncio.Lock())
     if lock.locked():
         try:
-            await update.callback_query.message.reply_text("⏳ Ei account-er ekta call request already process hocche. Ektu wait koro.")
+            message = interaction_message(update)
+            if message:
+                await message.reply_text("⏳ আপনার একটি কলের অনুরোধ প্রক্রিয়াধীন আছে। একটু অপেক্ষা করুন।")
         except Exception:
             pass
         return
@@ -1604,21 +1875,27 @@ async def execute_pending_call(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    source_message = interaction_message(update)
+    if source_message is None:
+        return
     settings = get_settings()
     u = get_user(user_id)
     if u.get("is_blocked") and not is_admin(user_id):
-        await update.callback_query.message.reply_text("⛔ Your account is blocked.")
+        await source_message.reply_text("⛔ আপনার অ্যাকাউন্ট বন্ধ করা হয়েছে।")
         return
     if settings.get("maintenance", False):
-        await update.callback_query.message.reply_text("🛠 Call maintenance ON ache. Ekhon call temporarily disabled; other features cholbe.")
+        await source_message.reply_text("🛠 কল সার্ভিস রক্ষণাবেক্ষণে আছে। অন্য ফিচারগুলো চালু থাকবে।")
         context.user_data.clear()
         return
     phone = context.user_data.get("call_phone")
     txt = context.user_data.get("call_text")
     audio = context.user_data.get("call_audio_url")
-    seconds = int(context.user_data.get("call_time", 30))
+    seconds = _safe_int(context.user_data.get("call_time", 30)) or 30
+    if seconds < 10 or seconds > 300:
+        await source_message.reply_text("কলের সময় ১০ থেকে ৩০০ সেকেন্ডের মধ্যে হতে হবে।")
+        return
     if not phone or (not txt and not audio):
-        await update.callback_query.message.reply_text("❌ Call session incomplete. abar start koro.")
+        await source_message.reply_text("❌ কলের তথ্য অসম্পূর্ণ। Send Call থেকে আবার শুরু করুন।")
         context.user_data.clear()
         return
     now_dt = now()
@@ -1626,7 +1903,7 @@ async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAU
     cooldown = max(0, _safe_int(settings.get("call_cooldown_seconds", 15)) if _safe_int(settings.get("call_cooldown_seconds", 15)) is not None else 15)
     if last_call is not None and (now_dt-last_call).total_seconds() < cooldown and not is_admin(user_id):
         wait = max(1, int(cooldown-(now_dt-last_call).total_seconds()))
-        await update.callback_query.message.reply_text(f"⏳ {wait}s wait kore abar try koro.")
+        await source_message.reply_text(f"⏳ পরের কল দেওয়ার আগে আরও {wait} সেকেন্ড অপেক্ষা করুন।")
         return
     day_key = local_day_key()
     calls_today = _safe_int(u.get("calls_today", 0)) or 0
@@ -1634,23 +1911,29 @@ async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAU
         calls_today = 0
     limit = max(0, _safe_int(settings.get("daily_call_limit", 20)) if _safe_int(settings.get("daily_call_limit", 20)) is not None else 20)
     if calls_today >= limit and not is_admin(user_id):
-        await update.callback_query.message.reply_text("🚫 Daily call limit reached.")
+        await source_message.reply_text("🚫 আজকের কলের সীমা শেষ হয়েছে।")
         context.user_data.clear()
         return
     cost = credits_float(settings.get("call_credit_cost", 1))
     balance = credits_float(u.get("balance", 0))
     if cost <= 0:
-        await update.callback_query.message.reply_text("⚠️ Admin call cost 0 set korte parbe na. Call charge valid korte admin-ke bolo.")
+        await source_message.reply_text("⚠️ কলের চার্জের সেটিং সঠিক নয়। অ্যাডমিনের সঙ্গে যোগাযোগ করুন।")
         context.user_data.clear()
         return
     if balance <= 0 or balance < cost:
-        await update.callback_query.message.reply_text(f"❌ Credits chara call deya jabe na. Required: {cost:g}; current balance: {balance:g}.")
+        await source_message.reply_text(f"❌ পর্যাপ্ত ক্রেডিট নেই। প্রয়োজন: {cost:g}; বর্তমান ব্যালেন্স: {balance:g}।")
         context.user_data.clear()
         return
 
     log_ref = db.collection(COL_CALLS).document()
+    call_template_title = clean_text(context.user_data.get("call_template_title", ""), 100)
+    selected_mode = str(context.user_data.get("call_mode", "")).lower()
+    audio_source = "template" if call_template_title else ("audio_upload" if selected_mode == "audio_upload" else "audio_url" if audio else "text_to_speech")
     log_ref.set({
-        "user_id": user_id, "number": phone, "mode": "text" if txt else "audio",
+        "user_id": user_id, "number": phone, "mode": "text" if txt else "template" if call_template_title else "audio",
+        "template_id": context.user_data.get("call_template_id"),
+        "template_title": call_template_title or None,
+        "audio_source": audio_source,
         "time": seconds, "status": "pending", "provider_call_id": None,
         "recording_url": None, "created_at": now_dt, "updated_at": now_dt,
         "cost": cost, "api_response": None,
@@ -1663,14 +1946,14 @@ async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAU
         }, merge=True)
     except Exception as exc:
         log_ref.update({"status": "rejected", "error": clean_text(exc, 500), "updated_at": now()})
-        await update.callback_query.message.reply_text(f"❌ {clean_text(exc, 500)}")
+        await source_message.reply_text(f"❌ {clean_text(exc, 500)}")
         context.user_data.clear()
         return
 
     progress_message = None
     try:
-        progress_message = await update.callback_query.message.reply_text(
-            "📡 SENDING CALL\nProvider API response-er jonno wait kora hocche. Ei message response pele update hobe...",
+        progress_message = await source_message.reply_text(
+            "📡 কল করা হচ্ছে…\nকল API-এর উত্তর আসা পর্যন্ত অপেক্ষা করুন। উত্তর পেলে এই বার্তাটি আপডেট হবে।",
             parse_mode=None,
         )
     except Exception:
@@ -1685,7 +1968,7 @@ async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAU
             except Exception:
                 pass
         try:
-            await update.callback_query.message.reply_text(text, parse_mode=None, reply_markup=reply_markup)
+            await source_message.reply_text(text, parse_mode=None, reply_markup=reply_markup)
         except Exception:
             pass
 
@@ -1720,7 +2003,7 @@ async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAU
         }, merge=True)
         if success:
             msg = (
-                "✅ CALL SUCCESS — Provider confirmed success.\n"
+                "✅ কল সফল — কল API সফলতা নিশ্চিত করেছে।\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 f"📞 Number: ****{phone[-4:]}\n"
                 f"⏱ Duration: {seconds}s\n"
@@ -1736,18 +2019,18 @@ async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAU
                 await report_call_result(msg)
         elif uncertain:
             msg = (
-                "⏳ CALL STATUS UNCONFIRMED\n"
+                "⏳ কলের ফলাফল এখনো নিশ্চিত নয়\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 f"Number: ****{phone[-4:]}\nCall ID: {clean_text(provider_id or log_ref.id, 120)}\n"
-                "Provider-er theke final success status paoa jayni, tai call success bola hocche na. Duplicate call avoid korte kichu khon wait koro. Credits temporarily reserved ache; provider confirmation pele history update hobe."
+                "Provider থেকে চূড়ান্ত সফলতার উত্তর পাওয়া যায়নি, তাই কল সফল বলা হচ্ছে না। একই নম্বরে দ্বিতীয়বার কল এড়াতে অপেক্ষা করুন। ক্রেডিট আপাতত সংরক্ষিত আছে; নিশ্চিত ফলাফল এলে ইতিহাস আপডেট হবে।"
             )
             await report_call_result(msg)
         else:
             refund_credits(user_id, cost, "call_refund", log_ref.id)
             await report_call_result(
-                "❌ CALL FAILED\n"
+                "❌ কল ব্যর্থ হয়েছে\n"
                 f"Reason: {clean_provider_message(result.get('message') or 'Provider rejected the request.') or 'Provider rejected the request.'}\n"
-                f"{cost:g} credits refund kora hoyeche."
+                f"{cost:g} ক্রেডিট ফেরত দেওয়া হয়েছে।"
             )
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
         # These errors occur before an HTTP connection is established, so the provider
@@ -1763,7 +2046,7 @@ async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAU
         except Exception:
             pass
         await report_call_result(
-            f"❌ Provider-er sathe connection hoyni. {cost:g} credits refund kora hoyeche. Kichu khon por abar try koro."
+                f"❌ Provider-এর সঙ্গে সংযোগ হয়নি। {cost:g} ক্রেডিট ফেরত দেওয়া হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।"
         )
     except Exception as exc:
         # Once a request may have left this server, a generic timeout/error is ambiguous.
@@ -1782,7 +2065,7 @@ async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAU
             }, merge=True)
         try:
             await report_call_result(
-                f"⏳ Call status unconfirmed. Provider explicit success dey ni. Call ID: {log_ref.id}. Call History check koro; duplicate call avoid korte retry korar age wait koro."
+                f"⏳ কলের চূড়ান্ত অবস্থা নিশ্চিত নয়। Provider সফলতার নিশ্চিত উত্তর দেয়নি। Call ID: {log_ref.id}। Call History দেখুন; আবার কল দেওয়ার আগে অপেক্ষা করুন।"
             )
         except Exception:
             pass
@@ -2047,7 +2330,7 @@ async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_T
     method = context.user_data.get("payment_method")
     number = context.user_data.get("payment_number")
     if not package or method not in {"bkash", "nagad"} or not number:
-        await update.effective_message.reply_text("❌ Purchase session incomplete. Buy Credits abar open koro.")
+        await update.effective_message.reply_text("❌ কেনাকাটার সেশন শেষ হয়েছে। Buy Credits আবার খুলুন।")
         context.user_data.clear()
         return
 
@@ -2056,18 +2339,18 @@ async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_T
     allowed, wait_seconds = await record_purchase_attempt(user_id)
     if not allowed:
         await update.effective_message.reply_text(
-            f"⏳ Purchase attempt limit reached. 10 minute-e maximum 3 request. "
-            f"{wait_seconds // 60}m {wait_seconds % 60}s pore try koro."
+            f"⏳ কেনাকাটার অনুরোধের সীমা পূর্ণ হয়েছে। ১০ মিনিটে সর্বোচ্চ ৩টি অনুরোধ করা যাবে। "
+            f"{wait_seconds // 60} মিনিট {wait_seconds % 60} সেকেন্ড পরে আবার চেষ্টা করুন।"
         )
         return
 
     txn_id = clean_text(txn_id, 100)
     if not re.fullmatch(r"[A-Za-z0-9_-]{3,100}", txn_id):
-        await update.effective_message.reply_text("❌ Invalid Transaction ID. 3–100 letters/digits/_/- use koro. Ei attempt count hoyeche.")
+        await update.effective_message.reply_text("❌ Transaction ID সঠিক নয়। ৩–১০০ অক্ষর/সংখ্যা অথবা _ / - ব্যবহার করুন। এই চেষ্টাটিও গণনা হয়েছে।")
         return
     duplicate_docs = list(db.collection(COL_PAYMENTS).stream())
     if any(str((snap.to_dict() or {}).get("transaction_id", "")).strip().casefold() == txn_id.casefold() for snap in duplicate_docs):
-        await update.effective_message.reply_text("❌ Ei Transaction ID age submit kora hoyeche. Ei attempt count hoyeche; unique valid ID dao.")
+        await update.effective_message.reply_text("❌ এই Transaction ID আগেই পাঠানো হয়েছে। এই চেষ্টাটিও গণনা হয়েছে; আলাদা সঠিক ID দিন।")
         return
 
     settings = get_settings()
@@ -2103,13 +2386,13 @@ async def create_payment_request(update: Update, context: ContextTypes.DEFAULT_T
         notify_error = clean_text(exc, 400)
         ref.update({"review_notify_error": notify_error, "updated_at": now()})
         try:
-            await context.bot.send_message(ADMIN_ID, f"⚠️ Payment request {ref.id} group-e post hoyni. Review group/bot permissions check koro.")
+            await context.bot.send_message(ADMIN_ID, f"⚠️ Payment request {ref.id} গ্রুপে পাঠানো যায়নি। Review group এবং bot-এর permission পরীক্ষা করুন।")
         except Exception:
             pass
     confirmation = (
         "✅ Payment request saved.\n"
         f"🆔 Request ID: {ref.id}\n"
-        "⏳ Payment verification pending. Admin approve korle credits auto add hobe."
+        "⏳ পেমেন্ট যাচাইয়ের অপেক্ষায় আছে। অ্যাডমিন অনুমোদন দিলে ক্রেডিট স্বয়ংক্রিয়ভাবে যোগ হবে।"
     )
     await update.effective_message.reply_text(confirmation, reply_markup=main_keyboard(user_id))
 
@@ -2148,6 +2431,7 @@ def admin_keyboard_markup():
         [InlineKeyboardButton(f"🎁 Daily Bonus: {daily_state}", callback_data="admin:toggle_daily", style="success" if settings.get("daily_bonus_enabled", False) else "danger")],
         [InlineKeyboardButton(f"🛠 Call Maintenance: {'ON' if settings.get('maintenance', False) else 'OFF'}", callback_data="admin:toggle_maintenance", style="danger" if settings.get("maintenance", False) else "success")],
         [InlineKeyboardButton("📦 Edit Packages", callback_data="admin:packages", style="primary"), InlineKeyboardButton("🔎 User Info", callback_data="admin:userinfo", style="primary")],
+        [InlineKeyboardButton("🎙️ Voice Templates", callback_data="admin:templates", style="success")],
         [InlineKeyboardButton("🔌 Provider", callback_data="admin:provider", style="primary"), InlineKeyboardButton("🛡 Safety", callback_data="admin:safety", style="danger")],
         [InlineKeyboardButton("⬅️ Home", callback_data="menu:home", style="primary")],
     ]
@@ -2155,7 +2439,7 @@ def admin_keyboard_markup():
 
 
 async def admin_menu(query):
-    await edit_or_send(query, "🛠 *Admin Panel*\n\nCredit, payment, user, referral, bonus, and call settings manage koro.", admin_keyboard_markup())
+    await edit_or_send(query, "🛠 *Admin Panel*\n\nক্রেডিট, পেমেন্ট, ব্যবহারকারী, রেফারেল, বোনাস ও কলের সেটিংস পরিচালনা করুন।", admin_keyboard_markup())
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2270,11 +2554,30 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c = s.to_dict() or {}
             lines.append(
                 f"`{str(c.get('user_id'))}` — ****{str(c.get('number',''))[-4:]} — "
-                f"{str(c.get('status'))} — {str(c.get('mode'))}"
+                f"{str(c.get('status'))} — {str(c.get('mode'))} — {clean_text(c.get('template_title') or '', 50)}"
             )
+            if c.get("audio_source"):
+                lines.append(f"  🎙️ Voice source: {clean_text(c.get('audio_source'), 30)}")
             if c.get("recording_url"):
                 lines.append("🎧 Recording URL stored.")
         await edit_or_send(query, "\n".join(lines), back_button())
+    elif action == "templates":
+        await show_voice_templates(query, context, admin_view=True)
+    elif action == "template_create_global":
+        context.user_data["state"] = "voice_template_upload_global"
+        context.user_data.pop("pending_voice_template", None)
+        await edit_or_send(query, "🎙️ সবার জন্য ভয়েস টেমপ্লেট তৈরি করতে MP3/WAV/OGG ফাইল অথবা ভয়েস মেসেজ পাঠান। এরপর টেমপ্লেটের নাম দিতে হবে।", None, parse_mode=None)
+    elif action.startswith("template_delete:"):
+        template_id = action.split(":", 1)[1]
+        template_ref = db.collection(COL_VOICE_TEMPLATES).document(template_id)
+        snapshot = template_ref.get()
+        template = snapshot.to_dict() if snapshot.exists else {}
+        if not template or str(template.get("scope", "personal")).lower() != "global":
+            await edit_or_send(query, "এই বৈশ্বিক টেমপ্লেটটি পাওয়া যায়নি।", admin_keyboard_markup(), parse_mode=None)
+            return
+        template_ref.delete()
+        audit("voice_template_deleted", query.from_user.id, {"template_id": template_id, "title": template.get("title")})
+        await show_voice_templates(query, context, admin_view=True)
     elif action == "broadcast":
         context.user_data["state"] = "admin_broadcast"
         await edit_or_send(query, "📣 Send the message to broadcast to all users.", back_button())
@@ -2325,7 +2628,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = f"{method}_number"
         context.user_data["state"] = f"admin_{method}_number"
         current_number = clean_text(get_settings().get(key, ""), 40) or "Not set"
-        await edit_or_send(query, f"💳 *Set {method.title()} Number*\n\nCurrent: `{current_number}`\n\nNew number pathao (8–15 digits), or `OFF` diye method disable koro.", back_button())
+        await edit_or_send(query, f"💳 *{method.title()} নম্বর সেট করুন*\n\nবর্তমান নম্বর: `{current_number}`\n\nনতুন নম্বর দিন (৮–১৫ অঙ্ক), অথবা মাধ্যম বন্ধ করতে `OFF` লিখুন।", back_button())
     elif action == "toggle_daily":
         settings = get_settings()
         enabled = not bool(settings.get("daily_bonus_enabled", False))
@@ -2479,7 +2782,7 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
         else:
             digits = re.sub(r"\D+", "", text)
             if not 8 <= len(digits) <= 15:
-                await update.effective_message.reply_text("❌ Invalid number. 8–15 digits pathao, or send OFF to disable this payment method.")
+                await update.effective_message.reply_text("❌ সঠিক নম্বর দিন (৮–১৫ অঙ্ক), অথবা এই পেমেন্ট মাধ্যম বন্ধ করতে OFF লিখুন।")
                 return
         save_settings({f"{method}_number": digits, **({"payment_number": digits} if digits else {})})
         audit("payment_number_changed", admin_id, {"method": method, "payment_number": digits})
@@ -2495,11 +2798,11 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
         target_id = _safe_int(re.sub(r"^(user_id|userid|chat_id|chatid|user|chat):", "", parts[0], flags=re.I))
         amount = credits_float(parts[1])
         if target_id is None or target_id == 0 or amount <= 0:
-            await update.effective_message.reply_text("❌ Invalid User ID/Chat ID or amount. Numeric Telegram ID and positive amount use koro.")
+            await update.effective_message.reply_text("❌ সঠিক সংখ্যার Telegram User ID/Chat ID এবং শূন্যের চেয়ে বেশি পরিমাণ দিন।")
             return
         target_ref = user_ref(target_id)
         if not target_ref.get().exists:
-            await update.effective_message.reply_text("❌ Ei ID-er bot account pai ni. User-ke age /start korte bolo, tarpor credit add koro.")
+            await update.effective_message.reply_text("❌ এই ID-এর অ্যাকাউন্ট পাওয়া যায়নি। আগে ব্যবহারকারীকে /start করতে বলুন, তারপর ক্রেডিট যোগ করুন।")
             return
         operation_ref = f"admin:{admin_id}:{update.effective_message.message_id}:{target_id}"
         try:
@@ -2524,7 +2827,7 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
         raw = text.strip()
         target_id = _safe_int(re.sub(r"^(user_id|userid|chat_id|chatid|user|chat):", "", raw, flags=re.I))
         if target_id is None or target_id == 0:
-            await update.effective_message.reply_text("❌ Numeric Telegram User ID/private Chat ID pathao.")
+            await update.effective_message.reply_text("❌ সংখ্যায় Telegram User ID অথবা ব্যক্তিগত Chat ID পাঠান।")
             return
         target_ref = user_ref(target_id)
         if not target_ref.get().exists:
@@ -2534,7 +2837,7 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
         target_ref.update({"is_blocked": blocked, "updated_at": now()})
         audit("user_blocked" if blocked else "user_unblocked", admin_id, {"target_id": target_id})
         try:
-            await context.bot.send_message(target_id, "⛔ Admin tomar account block koreche." if blocked else "✅ Admin tomar account unblock koreche.")
+            await context.bot.send_message(target_id, "⛔ অ্যাডমিন আপনার অ্যাকাউন্ট ব্লক করেছেন।" if blocked else "✅ অ্যাডমিন আপনার অ্যাকাউন্ট আনব্লক করেছেন।")
         except Exception:
             pass
         context.user_data.clear()
@@ -2586,7 +2889,7 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"Code: {code}\nCredits: {amount:g}\n"
                 f"Max uses: {'Unlimited' if max_uses == 0 else max_uses}\n"
                 f"Expires: {'Never' if not days else iso(expires)}\n"
-                f"Code record: {code_ref.id}\n\nAdmin Panel → Redeem Codes theke delete korte parbe.",
+                f"কোডের রেকর্ড: {code_ref.id}\n\nAdmin Panel → Redeem Codes থেকে এটি মুছে ফেলতে পারবেন।",
                 reply_markup=main_keyboard(admin_id),
             )
             context.user_data.clear()
@@ -2619,7 +2922,7 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 found = True
                 break
         if not found:
-            await update.effective_message.reply_text("❌ Package ID not found. Admin Panel → Edit Packages theke ID dekho.")
+            await update.effective_message.reply_text("❌ Package ID পাওয়া যায়নি। Admin Panel → Edit Packages থেকে ID দেখুন।")
             return
         save_settings({"packages": packages})
         audit("package_updated", admin_id, {"package_id": package_id, "price": price, "credits": credits})
@@ -2630,7 +2933,7 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if state == "admin_userinfo":
         target_id = _safe_int(re.sub(r"^(user_id|userid|chat_id|chatid|user|chat):", "", text.strip(), flags=re.I))
         if target_id is None or target_id == 0:
-            await update.effective_message.reply_text("❌ Numeric Telegram User ID / Chat ID pathao.")
+            await update.effective_message.reply_text("❌ সংখ্যায় Telegram User ID অথবা Chat ID পাঠান।")
             return
         target_ref = user_ref(target_id)
         snap = target_ref.get()
@@ -2663,7 +2966,7 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def do_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     if not text:
-        await update.effective_message.reply_text("Message empty. Text pathao.")
+        await update.effective_message.reply_text("বার্তাটি খালি। কিছু লেখা পাঠান।")
         return
     users = list(db.collection(COL_USERS).stream())
     ok = 0
@@ -2764,7 +3067,7 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         packages = list(settings.get("packages", []))
         target_package = next((pkg for pkg in packages if str(pkg.get("id")) == package_id), None)
         if not target_package:
-            await update.effective_message.reply_text("Package not found.")
+            await update.effective_message.reply_text("প্যাকেজটি পাওয়া যায়নি।")
             return
         target_package[field] = int(numeric_value) if field == "price" else credits_float(numeric_value)
         target_package["label"] = f"📞 {credits_float(target_package.get('credits', 0)):g} Calls — {int(target_package.get('price', 0))} TK"
@@ -2773,7 +3076,7 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"✅ Updated {package_id}: {target_package['label']}")
         return
     else:
-        await update.effective_message.reply_text("Unsupported setting. /help dekho.")
+        await update.effective_message.reply_text("এই সেটিংটি সমর্থিত নয়। বিস্তারিত জানতে /help দেখুন।")
         return
     save_settings({key: value})
     audit("setting_changed", update.effective_user.id, {"key": key, "value": value})
@@ -2782,34 +3085,34 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
     lines = [
-        "📘 Custom Call Bot Help", "",
-        "📞 User Features", "/start — Dashboard open", "/call — Start a call", "/cancel — Cancel current action", 
-        "Send Call, My Profile, Refer, LP Statistics, Buy Credits, Redeem, Call History, Support use koro.",
-        "Referral Bonus: 1 Credit. Link share koro ar credit jite nao. Daily Bonus admin ON korle button dekhabe.",
-        "Required channel join kora mandatory.", "",
+        "📘 Custom Call Bot সহায়িকা", "",
+        "📞 ব্যবহারকারীর সুবিধা", "/start — ড্যাশবোর্ড খুলুন", "/call — কল শুরু করুন", "/cancel — চলমান কাজ বাতিল করুন",
+        "Send Call, My Profile, Refer, LP Statistics, Buy Credits, Redeem, Call History ও Support বাটন ব্যবহার করুন।",
+        "রেফারেল বোনাস: ১ ক্রেডিট। লিংক শেয়ার করে যোগ্য নতুন ব্যবহারকারী আনুন। অ্যাডমিন Daily Bonus চালু করলে বাটন দেখা যাবে।",
+        "নির্ধারিত চ্যানেলে যোগ দেওয়া বাধ্যতামূলক।", "",
     ]
     if is_admin(uid):
         lines += [
-            "🛠 Admin Commands", "/admin — Admin Panel", "/help — This guide",
+            "🛠 অ্যাডমিন কমান্ড", "/admin — Admin Panel", "/help — এই সহায়িকা",
             "/addcredits USER_ID_OR_CHAT_ID AMOUNT", "/block USER_ID", "/unblock USER_ID", "/userinfo USER_ID",
             "",
-            "Package edit: Admin Panel → Edit Packages → send PACKAGE_ID PRICE CREDITS, e.g. p50 60 50.",
-            "Tier: 50+ TK = PRO, 100+ = MAX, 180+ = VIP, 240+ = ELITE, 380+ = LEGEND. Tier becomes INACTIVE when balance reaches zero.",
+            "প্যাকেজ পরিবর্তন: Admin Panel → Edit Packages → PACKAGE_ID PRICE CREDITS পাঠান; যেমন p50 60 50।",
+            "সদস্যতার স্তর: ৫০+ টাকা = PRO, ১০০+ = MAX, ১৮০+ = VIP, ২৪০+ = ELITE, ৩৮০+ = LEGEND। ব্যালেন্স শূন্য হলে স্তর INACTIVE হবে।",
             "",
-            "⚙️ Settings using /set",
+            "⚙️ /set দিয়ে সেটিংস পরিবর্তন করুন",
             "/set call_credit_cost 1", "/set daily_call_limit 20", "/set call_cooldown_seconds 15",
             "/set referral_bonus 1", "/set welcome_bonus 1", "/set daily_bonus 1",
             "/set daily_bonus_enabled true", "/set maintenance false",
-            "/set bkash_number 01819202231", "/set nagad_number 01819202231", "/set nagad_number off to disable Nagad",
+            "/set bkash_number 01819202231", "/set nagad_number 01819202231", "/set nagad_number off — নগদ বন্ধ করতে",
             "/set payment_review_chat_id @ffxemon", "/set required_channel @CyberShunya_x",
             "/set purchase_limit_count 3", "/set purchase_limit_minutes 10",
             "/set package_p50_price 60", "/set package_p100_price 100", "/set support_contact_url tg://user?id=7034779471",
             "",
-            "Credit add format: numeric Telegram user ID / private chat ID + amount. User must start bot first.",
-            "Purchase protection: 3 transaction submission attempts per 10 minutes; invalid and duplicate Transaction IDs count toward the limit.",
-            "Redeem code create: Admin Panel → Create Redeem → CODE CREDITS MAX_USES DAYS, e.g. EMON50 50 100 30. Delete: Redeem Codes → tap Delete.",
-            "Channel membership cached for the day and rechecked automatically near midnight Asia/Dhaka; manual Join/Check refreshes immediately.",
-            "Block/Unblock user Admin Panel-er buttons thekeo kora jay.",
+            "ক্রেডিট যোগ: সংখ্যার Telegram User ID অথবা ব্যক্তিগত Chat ID, তারপর পরিমাণ দিন। ব্যবহারকারীকে আগে বট /start করতে হবে।",
+            "কেনাকাটার সুরক্ষা: ১০ মিনিটে সর্বোচ্চ ৩টি Transaction ID জমা দেওয়া যাবে; ভুল ও পুনরাবৃত্ত ID-ও গণনা হবে।",
+            "রিডিম কোড: Admin Panel → Create Redeem → CODE CREDITS MAX_USES DAYS; যেমন EMON50 50 100 30। মুছতে Redeem Codes থেকে Delete চাপুন।",
+            "চ্যানেলের সদস্যতা প্রতিদিন ক্যাশ করা হয় এবং স্বয়ংক্রিয়ভাবে ১২ ঘণ্টা পরপর পুনরায় যাচাই হয়। Join/Check বাটনে তাৎক্ষণিক যাচাই করা যায়।",
+            "ব্যবহারকারীকে ব্লক বা আনব্লক করতে Admin Panel-এর সংশ্লিষ্ট বাটন ব্যবহার করুন।",
         ]
     await update.effective_message.reply_text("\n".join(lines), reply_markup=main_keyboard(uid) if uid else None)
 
@@ -2830,7 +3133,7 @@ async def resolve_admin_target(update, context, action: str, target_text: str, a
         audit("user_blocked" if blocked else "user_unblocked", admin_id, {"target_id": target_id})
         await update.effective_message.reply_text(f"✅ User {target_id} {'blocked' if blocked else 'unblocked'}.")
         try:
-            await context.bot.send_message(target_id, "⛔ Admin tomar account block koreche." if blocked else "✅ Admin tomar account unblock koreche.")
+            await context.bot.send_message(target_id, "⛔ অ্যাডমিন আপনার অ্যাকাউন্ট ব্লক করেছেন।" if blocked else "✅ অ্যাডমিন আপনার অ্যাকাউন্ট আনব্লক করেছেন।")
         except Exception:
             pass
         return
@@ -2940,24 +3243,24 @@ async def call_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ensure_user(update.effective_user)
     if get_settings().get("maintenance", False):
-        await update.effective_message.reply_text("🛠 Call maintenance ON ache. Ekhon call temporarily disabled; other features cholbe.", reply_markup=main_keyboard(uid))
+        await update.effective_message.reply_text("🛠 কল সেবা রক্ষণাবেক্ষণে আছে। আপাতত কল বন্ধ; অন্য সুবিধাগুলো চালু আছে।", reply_markup=main_keyboard(uid))
         return
     if user_blocked(uid):
-        await update.effective_message.reply_text("⛔ Your account is blocked. Support-er sathe contact koro.")
+        await update.effective_message.reply_text("⛔ আপনার অ্যাকাউন্ট ব্লক করা হয়েছে। সহায়তার জন্য Support-এ যোগাযোগ করুন।")
         return
     u = get_user(uid)
     cost = credits_float(get_settings().get("call_credit_cost", 1))
     if credits_float(u.get("balance", 0)) <= 0 or credits_float(u.get("balance", 0)) < cost:
-        await update.effective_message.reply_text(f"❌ Call dite credit lagbe. Required: {cost:g} credits.", reply_markup=main_keyboard(uid))
+        await update.effective_message.reply_text(f"❌ কল দিতে ক্রেডিট প্রয়োজন। প্রয়োজন: {cost:g} ক্রেডিট।", reply_markup=main_keyboard(uid))
         return
     context.user_data.clear()
     context.user_data["state"] = "call_phone"
-    await update.effective_message.reply_text("📞 Destination phone number pathao.", reply_markup=back_button())
+    await update.effective_message.reply_text("📞 যে ফোন নম্বরে কল দিতে চান, সেটি পাঠান।")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     uid = update.effective_user.id
-    await update.effective_message.reply_text("Cancelled. Dashboard-e fire gele features use korte parbe.", reply_markup=main_keyboard(uid))
+    await update.effective_message.reply_text("অনুরোধ বাতিল করা হয়েছে। নিচের মেনু থেকে আবার শুরু করুন।", reply_markup=main_keyboard(uid))
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -3234,11 +3537,19 @@ async def startup():
     await telegram_app.start()
     channel_recheck_task = asyncio.create_task(channel_membership_midnight_worker(telegram_app.bot))
     try:
-        await telegram_app.bot.set_my_commands([
-            BotCommand("start", "Start"),
-        ])
+        user_commands = [BotCommand("start", "Start")]
+        # Clear previous command-menu entries and publish only /start in all common scopes.
+        for command_scope in (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats(), BotCommandScopeAllGroupChats()):
+            try:
+                await telegram_app.bot.delete_my_commands(scope=command_scope)
+            except Exception:
+                logger.warning("Could not clear a stale Telegram command scope: %s", type(command_scope).__name__)
+            try:
+                await telegram_app.bot.set_my_commands(user_commands, scope=command_scope)
+            except Exception:
+                logger.exception("Could not set the /start-only command list for %s", type(command_scope).__name__)
     except Exception:
-        pass
+        logger.exception("Could not set Telegram command menu")
 
     if PUBLIC_BASE_URL:
         webhook_url = f"{PUBLIC_BASE_URL}/telegram/webhook"
