@@ -1695,7 +1695,7 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
         support_url = clean_text(settings.get("support_contact_url") or SUPPORT_CONTACT_URL, 300)
         support_text = clean_text(settings.get("support_text", "সহায়তার জন্য নিচের বাটনে চাপ দিন।"), 1800)
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("✉️ Message Support Admin", url=support_url, style="primary")]])
-        await message.reply_text(f"☎️ Support\n{support_text}\nAdmin id: {@EMON_x_4}", reply_markup=markup)
+        await message.reply_text(f"☎️ Support\n{support_text}\nAdmin id: {7034779471}", reply_markup=markup)
         return
 
     if label == "🎁 Daily Bonus":
