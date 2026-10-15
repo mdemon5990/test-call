@@ -941,21 +941,21 @@ def profile_message(user_id: int, user_data: dict) -> str:
 
     }
     return (
-        "👤 <b>আমার প্রোফাইল</b>\n"
+                "👤 <b>My Profile</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"👑 <b>সদস্য:</b> {name}\n"
-        f"🪪 <b>টেলিগ্রাম আইডি:</b> <code>{user_id}</code>\n"
-        f"🔗 <b>ইউজারনেম:</b> @{username}\n"
+        f"👑 <b>Member:</b> {name}\n"
+        f"🪪 <b>Telegram ID:</b> <code>{user_id}</code>\n"
+        f"🔗 <b>Username:</b> @{username}\n"
         f"📅 <b>Joined:</b> {html.escape(joined_text)}\n"
-        f"💳 <b>ক্রেডিট ব্যালেন্স: {balance:.2f}</b>\n\n"
+        f"💳 <b>Credit Balance: {balance:.2f}</b>\n\n"
         f"🏅 <b>Membership:</b> {html.escape(subscription_badge(tier))}\n"
         f"{html.escape(tier_lines.get(tier, tier_lines['INACTIVE']))}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"📞 <b>মোট কল:</b> {_safe_int(user_data.get('total_calls', 0)) or 0}\n"
-        f"✅ <b>সফল কল:</b> {_safe_int(user_data.get('successful_calls', 0)) or 0}\n"
-        f"❌ <b>ব্যর্থ কল:</b> {_safe_int(user_data.get('failed_calls', 0)) or 0}\n"
-        f"👥 <b>রেফারেল:</b> {_safe_int(user_data.get('referrals', 0)) or 0}\n"
-        f"💠 <b>সর্বোচ্চ কেনাকাটার স্তর:</b> {html.escape(clean_text(user_data.get('subscription_paid_tier', 'NONE'), 30).upper())}\n"
+        f"📞 <b>Total Calls:</b> {_safe_int(user_data.get('total_calls', 0)) or 0}\n"
+        f"✅ <b>Successful Calls:</b> {_safe_int(user_data.get('successful_calls', 0)) or 0}\n"
+        f"❌ <b>Failed Calls:</b> {_safe_int(user_data.get('failed_calls', 0)) or 0}\n"
+        f"👥 <b>Referrals:</b> {_safe_int(user_data.get('referrals', 0)) or 0}\n"
+        f"💠 <b>Highest Purchase Tier:</b> {html.escape(clean_text(user_data.get('subscription_paid_tier', 'NONE'), 30).upper())}\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
@@ -1181,8 +1181,8 @@ async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"\n\nℹ️ {escape_markdown(clean_text(notice, 500), version=1)}"
     if is_new_user:
         welcome = (
-            f"🎉 স্বাগতম, {clean_text(tg_user.first_name or 'বন্ধু', 80)}!\n\n"
-            "Custom Call Bot-এ আপনাকে স্বাগতম। আপনার অ্যাকাউন্ট তৈরি হয়েছে এবং স্বাগতম বোনাসের নিয়ম অনুযায়ী ক্রেডিট যোগ করা হয়েছে।\n\n"
+            f"🎉 Welcome, {clean_text(tg_user.first_name or 'বন্ধু', 80)}!\n\n"
+            "Custom Call Bot-এ আপনাকে স্বাগতম।\n\n"
             "নিচের মেনু থেকে একটি অপশন বেছে নিন।"
         )
         text = welcome + "\n\n" + text
@@ -1254,8 +1254,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_new_user:
                 new_user_data = get_user(user_id)
                 welcome = (
-                    f"🎉 স্বাগতম, {clean_text(query.from_user.first_name or 'বন্ধু', 80)}!\n\n"
-                    "Custom Call Bot-এ আপনাকে স্বাগতম। আপনার অ্যাকাউন্ট তৈরি হয়েছে। \n\n"
+                    f"🎉 Welcome, {clean_text(query.from_user.first_name or 'বন্ধু', 80)}!\n\n"
+                    "Custom Call Bot-এ আপনাকে স্বাগতম। \n\n"
                     f"💳 আপনার ব্যালেন্স: {format_balance(new_user_data.get('balance', 0))} ক্রেডিট\n"
                     "নিচের মেনু থেকে একটি সুবিধা নির্বাচন করুন।"
                 )
@@ -1642,8 +1642,8 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
         totals = await local_stats()
         lines = [
             "📊 LP Statistics", "━━━━━━━━━━━━━━━━━",
-            f"Users: 5{totals['users']}",
-            f"Total Calls: 6{totals['calls']}",
+            f"Users: {totals['users']}",
+            f"Total Calls: {totals['calls']}",
             "", "🏆 Top Credit Holders",
         ]
         top_users = [item for item in totals.get("top_users", []) if credits_float(item.get("balance", 0)) > 0]
