@@ -927,6 +927,9 @@ def profile_message(user_id: int, user_data: dict) -> str:
     username = html.escape(clean_text(user_data.get("username") or "নেই", 100))
     balance = credits_float(user_data.get("balance", 0))
     tier = subscription_for_profile(user_data)
+    joined_value = user_data.get("created_at") or user_data.get("joined_at") or user_data.get("first_seen_at")
+    joined_dt = parse_datetime(joined_value)
+    joined_text = joined_dt.astimezone(ZoneInfo("Asia/Dhaka")).strftime("%d %b %Y, %I:%M %p") if joined_dt else "Not available"
     tier_lines = {
         "INACTIVE": "সদস্যতা চালু করতে একটি ক্রেডিট প্যাকেজ কিনুন।",
         "ACTIVE": "আপনার অ্যাকাউন্ট সক্রিয়।",
@@ -942,8 +945,9 @@ def profile_message(user_id: int, user_data: dict) -> str:
         f"👑 <b>সদস্য:</b> {name}\n"
         f"🪪 <b>টেলিগ্রাম আইডি:</b> <code>{user_id}</code>\n"
         f"🔗 <b>ইউজারনেম:</b> @{username}\n"
+        f"📅 <b>Joined:</b> {html.escape(joined_text)}\n"
         f"💳 <b>ক্রেডিট ব্যালেন্স: {balance:.2f}</b>\n\n"
-        f"🏅 <b>সদস্যতা: {html.escape(subscription_badge(tier))}</b>\n"
+        f"🏅 <b>Membership:</b> {html.escape(subscription_badge(tier))}\n"
         f"{html.escape(tier_lines.get(tier, tier_lines['INACTIVE']))}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"📞 <b>মোট কল:</b> {_safe_int(user_data.get('total_calls', 0)) or 0}\n"
@@ -1513,34 +1517,43 @@ async def select_package(query, context, pkg_id: str):
     if not package:
         await edit_or_send(query, "প্যাকেজটি পাওয়া যায়নি।", back_button())
         return
+
+    # Keep the chosen package in the user's session, but do not reveal any
+    # account number until the user explicitly selects bKash/Nagad/Rocket.
     context.user_data["payment_package"] = package
+    context.user_data.pop("payment_method", None)
+    context.user_data.pop("payment_number", None)
+    context.user_data.pop("payment_action", None)
+    context.user_data["state"] = "choose_payment_method"
+
     methods = []
     payment_labels = {"bkash": "💗 bKash", "nagad": "🧡 Nagad", "rocket": "🚀 Rocket"}
     action_labels = {"payment": "Payment", "send_money": "Send Money", "cash_out": "Cash Out"}
-    number_lines = []
     for method in settings.get("payment_methods", []):
         if not method.get("enabled") or not clean_text(method.get("account"), 40):
             continue
         key = clean_text(method.get("key"), 20).lower()
+        if key not in {"bkash", "nagad", "rocket"}:
+            continue
         name = payment_labels.get(key, clean_text(method.get("name", key), 30))
         action_label = action_labels.get(method.get("action"), "Send Money")
-        account = clean_text(method.get("account"), 40)
-        number_lines.append(f"• {name} — {action_label}: *{account}*")
-        methods.append([
-            InlineKeyboardButton(f"{name} · {action_label}", callback_data=f"paymethod:{key}", style="success" if key == "bkash" else "primary"),
-            InlineKeyboardButton("📋 নম্বর কপি", copy_text=CopyTextButton(text=account), style="success"),
-        ])
+        methods.append([InlineKeyboardButton(
+            f"{name} · {action_label}",
+            callback_data=f"paymethod:{key}",
+            style="success" if key == "bkash" else "primary",
+        )])
     methods.append([InlineKeyboardButton("⬅️ বাতিল", callback_data="menu:buy", style="primary")])
     if len(methods) == 1:
         await edit_or_send(query, "❌ অ্যাডমিন এখনো কোনো পেমেন্ট মাধ্যম চালু করেননি।", back_button())
         return
+
     await edit_or_send(
         query,
-        f"📦 *{clean_text(package.get('label'),100)}*\n"
-        f"ক্রেডিট: *{credits_float(package.get('credits', 0)):g}*\n"
-        f"মূল্য: *{int(package.get('price', 0))} TK*\n\n"
-        "💳 *পেমেন্ট নম্বর*\n" + "\n".join(number_lines) + "\n\n"
-        "সঠিক নম্বরে প্রদর্শিত লেনদেনের ধরন অনুযায়ী টাকা পাঠান। নম্বর কপি করতে পাশের বাটনে চাপ দিন, অথবা পেমেন্ট মাধ্যম নির্বাচন করে Transaction ID জমা দিন।",
+        f"📦 *{clean_text(package.get('label'), 100)}*\n"
+        f"💳 ক্রেডিট: *{credits_float(package.get('credits', 0)):g}*\n"
+        f"💰 মূল্য: *৳{int(package.get('price', 0))}*\n\n"
+        "পেমেন্ট করার জন্য একটি মাধ্যম নির্বাচন করুন।\n"
+        "পরের ধাপে সেই মাধ্যমের নম্বর ও কপি করার বাটন দেখানো হবে।",
         InlineKeyboardMarkup(methods),
     )
 
@@ -1573,10 +1586,13 @@ async def select_payment_method(query, context, method: str):
     await edit_or_send(
         query,
         f"💳 *{clean_text(method_data.get('name'), 30)} — {action_label}*\n\n"
-        f"পেমেন্ট নম্বর: *{number}*\n"
-        f"প্যাকেজ: *{clean_text(package.get('label'),100)}*\n"
-        f"মূল্য: *{int(package.get('price',0))} TK*\n\n"
-        f"উপরের নম্বরে {action_label} করুন। তারপর Transaction ID পাঠান। একই Transaction ID দ্বিতীয়বার গ্রহণ করা হবে না।",
+        f"📦 প্যাকেজ: *{clean_text(package.get('label'), 100)}*\n"
+        f"💰 পাঠাতে হবে: *৳{int(package.get('price', 0))}*\n"
+        f"📱 পেমেন্ট নম্বর: *{number}*\n\n"
+        f"১. উপরের নম্বরটি কপি করুন।\n"
+        f"২. ঠিক *৳{int(package.get('price', 0))}* টাকা {action_label} করে পাঠান।\n"
+        "৩. টাকা পাঠানোর পর Transaction ID এখানে পাঠান।\n\n"
+        "⚠️ টাকা না পাঠালে বা Transaction ID যাচাই না হলে ক্রেডিট যোগ হবে না। অ্যাডমিন যাচাই করে অনুমোদন দিলে তবেই ক্রেডিট পাবেন।",
         markup,
     )
 
@@ -1998,7 +2014,7 @@ async def _execute_pending_call_impl(update: Update, context: ContextTypes.DEFAU
     progress_message = None
     try:
         progress_message = await source_message.reply_text(
-            "📡 কল করা হচ্ছে…\nকল API-এর উত্তর আসা পর্যন্ত অপেক্ষা করুন। উত্তর পেলে এই বার্তাটি আপডেট হবে।",
+            "📞 আপনার কলটি প্রক্রিয়াধীন…\nফলাফল নিশ্চিত হলেই এখানে জানানো হবে।",
             parse_mode=None,
         )
     except Exception:
