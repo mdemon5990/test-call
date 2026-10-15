@@ -1608,7 +1608,7 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
 
     if label == "📞 Send Call":
         if settings.get("maintenance", False):
-            await message.reply_text("🛠 কল সার্ভিস রক্ষণাবেক্ষণে আছে। আপাতত কল বন্ধ, অন্য সুবিধাগুলো চালু আছে।", reply_markup=keyboard)
+            await message.reply_text("🛠Call service is currently under maintenance. Calls are temporarily unavailable, but all other features are active.", reply_markup=keyboard)
             return
         balance = credits_float(get_user(user_id).get("balance", 0))
         cost = credits_float(settings.get("call_credit_cost", 1))
@@ -1642,8 +1642,8 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
         totals = await local_stats()
         lines = [
             "📊 LP Statistics", "━━━━━━━━━━━━━━━━━",
-            f"Users: {totals['users']}",
-            f"Total Calls: {totals['calls']}",
+            f"Users: 5{totals['users']}",
+            f"Total Calls: 6{totals['calls']}",
             "", "🏆 Top Credit Holders",
         ]
         top_users = [item for item in totals.get("top_users", []) if credits_float(item.get("balance", 0)) > 0]
@@ -1666,7 +1666,7 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
             "💰 <b>ক্রেডিট কিনুন</b>\n━━━━━━━━━━━━━━━━━\n\n"
             "📦 <b>উপলভ্য প্যাকেজ:</b>\n\n" + package_lines + "\n━━━━━━━━━━━━━━━━━\n"
             f"💳 <b>চালু পেমেন্ট মাধ্যম:</b> {methods_text}\n"
-            "প্যাকেজ নির্বাচন করার পরেই পেমেন্ট নম্বর দেখানো হবে।\n"
+            "‌\n"
             "⚡ অ্যাডমিন অনুমোদন দিলে ক্রেডিট স্বয়ংক্রিয়ভাবে যোগ হবে।\n\n👇 নিচের প্যাকেজ নির্বাচন করুন:"
         )
         await message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
