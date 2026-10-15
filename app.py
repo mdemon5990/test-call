@@ -301,7 +301,7 @@ DEFAULT_SETTINGS = {
     "brand_name": "Custom Call",
     "maintenance": False,
     "call_credit_cost": 1.0,
-    "daily_call_limit": 20,
+    "daily_call_limit": 100,
     "call_cooldown_seconds": 15,
     "referral_bonus": 1.0,
     "daily_bonus": 1.0,
@@ -931,13 +931,14 @@ def profile_message(user_id: int, user_data: dict) -> str:
     joined_dt = parse_datetime(joined_value)
     joined_text = joined_dt.astimezone(ZoneInfo("Asia/Dhaka")).strftime("%d %b %Y, %I:%M %p") if joined_dt else "Not available"
     tier_lines = {
-        "INACTIVE": "সদস্যতা চালু করতে একটি ক্রেডিট প্যাকেজ কিনুন।",
-        "ACTIVE": "আপনার অ্যাকাউন্ট সক্রিয়।",
-        "PRO": "PRO সদস্যতা সক্রিয় — প্রিমিয়াম সুবিধা উপভোগ করুন।",
-        "MAX": "MAX সদস্যতা সক্রিয় — আপনার প্রিমিয়াম সুবিধা চালু আছে।",
-        "VIP": "VIP সদস্যতা সক্রিয় — সেবা ব্যবহারের জন্য ধন্যবাদ।",
-        "ELITE": "ELITE সদস্যতা সক্রিয় — বিশেষ সুবিধা চালু হয়েছে।",
-        "LEGEND": "LEGEND সদস্যতা সক্রিয় — সর্বোচ্চ প্যাকেজ চালু আছে।",
+                "INACTIVE": "Purchase a credit package to activate your membership.",
+        "ACTIVE": "Your account is active.",
+        "PRO": "PRO membership active — enjoy premium benefits.",
+        "MAX": "MAX membership active — your premium benefits are enabled.",
+        "VIP": "VIP membership active — thank you for using our service.",
+        "ELITE": "ELITE membership active — special benefits have been unlocked.",
+        "LEGEND": "LEGEND membership active — maximum package is active.",
+
     }
     return (
         "👤 <b>আমার প্রোফাইল</b>\n"
@@ -1254,7 +1255,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 new_user_data = get_user(user_id)
                 welcome = (
                     f"🎉 স্বাগতম, {clean_text(query.from_user.first_name or 'বন্ধু', 80)}!\n\n"
-                    "Custom Call Bot-এ আপনাকে স্বাগতম। আপনার অ্যাকাউন্ট তৈরি হয়েছে। নিয়ম অনুযায়ী স্বাগতম ক্রেডিট যোগ করা হয়েছে।\n\n"
+                    "Custom Call Bot-এ আপনাকে স্বাগতম। আপনার অ্যাকাউন্ট তৈরি হয়েছে। \n\n"
                     f"💳 আপনার ব্যালেন্স: {format_balance(new_user_data.get('balance', 0))} ক্রেডিট\n"
                     "নিচের মেনু থেকে একটি সুবিধা নির্বাচন করুন।"
                 )
@@ -1298,7 +1299,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         me = await context.bot.get_me()
         referral_link = f"https://t.me/{me.username}?start=ref_{user_id}"
         bonus = credits_float(get_settings().get("referral_bonus", 1))
-        text = ("👥 *বন্ধুদের আমন্ত্রণ করুন*\n\n" f"রেফারেল বোনাস: *{bonus:g} ক্রেডিট*\n" f"লিংক শেয়ার করুন এবং *{bonus:g} ক্রেডিট জিতে নিন!*\n\n" f"আপনার লিংক:\n`{escape_markdown(referral_link, version=1)}`\n\n" "বোনাস শুধু যোগ্য নতুন ব্যবহারকারীর জন্য। যে ব্যক্তি আগে থেকেই প্রয়োজনীয় চ্যানেলের সদস্য ছিলেন, তার জন্য রেফারেল বোনাস দেওয়া হবে না।")
+        text = ("👥 *বন্ধুদের আমন্ত্রণ করুন*\n\n" f"রেফারেল বোনাস: *{bonus:g} ক্রেডিট*\n" f"লিংক শেয়ার করুন এবং *{bonus:g} ক্রেডিট জিতে নিন!*\n\n" f"আপনার লিংক:\n`{escape_markdown(referral_link, version=1)}`\n\n" "বোনাস শুধু যোগ্য নতুন ব্যবহারকারীর জন্য।")
         await edit_or_send(query, text, referral_keyboard(referral_link))
         return
 
@@ -1485,7 +1486,7 @@ async def show_buy(query, context):
         "📦 *Available Packages:*\n\n" + package_lines +
         "\n━━━━━━━━━━━━━━━━━\n"
         f"💳 পেমেন্ট মাধ্যম: *{methods_text}*\n"
-        "প্যাকেজ নির্বাচন করার পর পেমেন্ট নম্বর দেখানো হবে।\n"
+        "‌\n"
         "⚡ অ্যাডমিন অনুমোদন দিলে ক্রেডিট স্বয়ংক্রিয়ভাবে যোগ হবে।\n\n"
         "👇 নিচের প্যাকেজ নির্বাচন করুন।"
     )
@@ -1553,7 +1554,7 @@ async def select_package(query, context, pkg_id: str):
         f"💳 ক্রেডিট: *{credits_float(package.get('credits', 0)):g}*\n"
         f"💰 মূল্য: *৳{int(package.get('price', 0))}*\n\n"
         "পেমেন্ট করার জন্য একটি মাধ্যম নির্বাচন করুন।\n"
-        "পরের ধাপে সেই মাধ্যমের নম্বর ও কপি করার বাটন দেখানো হবে।",
+        "‌",
         InlineKeyboardMarkup(methods),
     )
 
@@ -1632,7 +1633,7 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
             f"রেফারেল বোনাস: {bonus:g} ক্রেডিট\n"
             f"লিংক শেয়ার করুন এবং {bonus:g} ক্রেডিট জিতে নিন!\n\n"
             f"আপনার রেফারেল লিংক:\n{referral_link}\n\n"
-            "বোনাস শুধু যোগ্য নতুন ব্যবহারকারীর জন্য। আগে থেকেই প্রয়োজনীয় চ্যানেলের সদস্য হলে বোনাস পাওয়া যাবে না।",
+            "বোনাস শুধু যোগ্য নতুন ব্যবহারকারীর জন্য। ",
             reply_markup=referral_keyboard(referral_link),
         )
         return
@@ -1694,7 +1695,7 @@ async def handle_dashboard_button(update: Update, context: ContextTypes.DEFAULT_
         support_url = clean_text(settings.get("support_contact_url") or SUPPORT_CONTACT_URL, 300)
         support_text = clean_text(settings.get("support_text", "সহায়তার জন্য নিচের বাটনে চাপ দিন।"), 1800)
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("✉️ Message Support Admin", url=support_url, style="primary")]])
-        await message.reply_text(f"☎️ সহায়তা\n{support_text}\nঅ্যাডমিন আইডি: {ADMIN_ID}", reply_markup=markup)
+        await message.reply_text(f"☎️ Support\n{support_text}\nAdmin id: {@EMON_x_4}", reply_markup=markup)
         return
 
     if label == "🎁 Daily Bonus":
